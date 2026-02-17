@@ -7,14 +7,29 @@
 #include <string>
 #include <optional>
 #include <chrono>
+#include <mutex>
+#include <thread>
+#include <atomic>
 
 namespace SR {
 
 class TemplateManager
 {
 public:
-    void scan(const std::filesystem::path& farmPath);
-    const std::vector<JobTemplate>& templates() const { return m_templates; }
+    ~TemplateManager();
+
+    TemplateManager() = default;
+    TemplateManager(const TemplateManager&) = delete;
+    TemplateManager& operator=(const TemplateManager&) = delete;
+
+    // Start background scanning thread. First scan is synchronous.
+    void start(const std::filesystem::path& farmPath);
+
+    // Stop background thread.
+    void stop();
+
+    // Thread-safe snapshot for UI
+    std::vector<JobTemplate> getTemplateSnapshot() const;
 
     JobManifest bakeManifest(const JobTemplate& tmpl,
                              const std::vector<std::string>& flagValues,
@@ -55,11 +70,17 @@ public:
         const std::filesystem::path& jobsDir);
 
 private:
-    std::vector<JobTemplate> m_templates;
-    std::chrono::steady_clock::time_point m_lastScan{};
-    static constexpr int SCAN_COOLDOWN_MS = 5000;
+    void threadFunc();
+    std::vector<JobTemplate> doScan();
+    void loadTemplatesFromDir(const std::filesystem::path& dir, bool isExample,
+                              std::vector<JobTemplate>& out);
 
-    void loadTemplatesFromDir(const std::filesystem::path& dir, bool isExample);
+    std::filesystem::path m_farmPath;
+    std::vector<JobTemplate> m_templates;
+    mutable std::mutex m_mutex;
+    std::atomic<bool> m_running{false};
+    std::thread m_thread;
+    static constexpr int SCAN_COOLDOWN_MS = 5000;
 };
 
 } // namespace SR

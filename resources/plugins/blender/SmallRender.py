@@ -7,7 +7,7 @@
 bl_info = {
     "name": "SmallRender",
     "author": "SmallRender",
-    "version": (0, 1, 0),
+    "version": (0, 1, 2),
     "blender": (4, 0, 0),
     "location": "Render Properties > SmallRender",
     "description": "Submit render jobs to SmallRender farm",
@@ -205,6 +205,12 @@ class SMALLRENDER_OT_sync_from_scene(Operator):
         return {'FINISHED'}
 
 
+# ── Submit cooldown ──────────────────────────────────────────────────────────
+
+_submit_cooldown_until = 0.0
+_SUBMIT_COOLDOWN_SECS = 2.0
+
+
 # ── Submit Operator ───────────────────────────────────────────────────────────
 
 class SMALLRENDER_OT_submit(Operator):
@@ -213,6 +219,10 @@ class SMALLRENDER_OT_submit(Operator):
     bl_description = "Submit render job(s) to SmallRender farm"
 
     def execute(self, context):
+        global _submit_cooldown_until
+        if time.time() < _submit_cooldown_until:
+            self.report({'WARNING'}, "Already submitted — please wait a few seconds.")
+            return {'CANCELLED'}
         settings = context.scene.smallrender
 
         # Validate farm connection
@@ -313,6 +323,7 @@ class SMALLRENDER_OT_submit(Operator):
                 self.report({'ERROR'}, "Failed to write submission: {}".format(e))
                 return {'CANCELLED'}
 
+        _submit_cooldown_until = time.time() + _SUBMIT_COOLDOWN_SECS
         self.report({'INFO'}, "Submitted {} job{}".format(
             submitted, "s" if submitted != 1 else ""))
         return {'FINISHED'}
@@ -400,11 +411,15 @@ class SMALLRENDER_PT_main(Panel):
 
         layout.separator()
 
-        # Submit button
+        # Submit button (with cooldown feedback)
         row = layout.row()
         row.scale_y = 1.5
-        row.enabled = bool(bpy.data.filepath)
-        row.operator("smallrender.submit", text="Submit to Farm", icon='RENDER_ANIMATION')
+        in_cooldown = time.time() < _submit_cooldown_until
+        row.enabled = bool(bpy.data.filepath) and not in_cooldown
+        if in_cooldown:
+            row.operator("smallrender.submit", text="Submitted!", icon='CHECKMARK')
+        else:
+            row.operator("smallrender.submit", text="Submit to Farm", icon='RENDER_ANIMATION')
 
 
 # ── Registration ──────────────────────────────────────────────────────────────

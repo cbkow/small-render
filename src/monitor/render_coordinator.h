@@ -41,6 +41,7 @@ public:
 
     // Abort (kill-only — no drain concept)
     void abortCurrentRender(const std::string& reason);
+    void purgeJob(const std::string& jobId);  // Remove queued (not yet active) chunks for a job
     void setStopped(bool stopped);
     bool isStopped() const { return m_stopped; }
 

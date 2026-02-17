@@ -53,6 +53,9 @@ public:
     // UDP fast path: process compact heartbeat from UDP (main thread).
     void processUdpHeartbeat(const nlohmann::json& msg);
 
+    // UDP fast path: process goodbye from a shutting-down node (main thread).
+    void processUdpGoodbye(const nlohmann::json& msg);
+
     // Thread-safe read of local sequence number.
     uint64_t localSeq() const { return m_seq.load(); }
 

@@ -10,6 +10,7 @@
 #include "monitor/job_manager.h"
 #include "monitor/command_manager.h"
 #include "monitor/submission_manager.h"
+#include "monitor/ui_data_cache.h"
 #include "core/udp_notify.h"
 #include "core/message_dedup.h"
 #include "monitor/ui/dashboard.h"
@@ -18,6 +19,7 @@
 
 #include <filesystem>
 #include <chrono>
+#include <memory>
 #include <string>
 
 namespace SR {
@@ -50,6 +52,14 @@ public:
     JobManager& jobManager() { return m_jobManager; }
     RenderCoordinator& renderCoordinator() { return m_renderCoordinator; }
     CommandManager& commandManager() { return m_commandManager; }
+
+    // Cached snapshots (refreshed each frame from bg threads, zero FS)
+    const std::vector<JobInfo>& cachedJobs() const { return m_cachedJobs; }
+    const std::vector<JobTemplate>& cachedTemplates() const { return m_cachedTemplates; }
+
+    // UIDataCache accessor
+    UIDataCache& uiDataCache() { return *m_uiDataCache; }
+    const UIDataCache& uiDataCache() const { return *m_uiDataCache; }
 
     // Job controls (called from UI)
     void pauseJob(const std::string& jobId);
@@ -136,11 +146,16 @@ private:
     RenderCoordinator m_renderCoordinator;
     CommandManager m_commandManager;
     SubmissionManager m_submissionManager;
+    std::unique_ptr<UIDataCache> m_uiDataCache;
     UdpNotify m_udpNotify;
     MessageDedup m_dedup;
     std::chrono::steady_clock::time_point m_lastUdpHeartbeat{};
     std::chrono::steady_clock::time_point m_lastDedupPurge{};
     Dashboard m_dashboard;
+
+    // Cached snapshots (refreshed each frame from bg threads)
+    std::vector<JobInfo> m_cachedJobs;
+    std::vector<JobTemplate> m_cachedTemplates;
 
     // Farm state
     std::filesystem::path m_farmPath;
@@ -158,6 +173,16 @@ private:
     // Worker-side: buffered completions when coordinator is offline
     struct PendingCompletion { std::string jobId; ChunkRange chunk; std::string state; };
     std::vector<PendingCompletion> m_pendingCompletions;
+
+    // Worker-side: deferred assignments waiting for manifest to propagate
+    struct DeferredAssignment
+    {
+        CommandManager::Action action;
+        int retryCount = 0;
+        std::chrono::steady_clock::time_point nextRetry;
+    };
+    std::vector<DeferredAssignment> m_deferredAssignments;
+    void processDeferredAssignments();
 
     // Exit state
     bool m_exitRequested = false;

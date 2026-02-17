@@ -146,6 +146,29 @@ void HeartbeatManager::processUdpHeartbeat(const nlohmann::json& msg)
     info.lastUdpContactMs = myNow;
 }
 
+void HeartbeatManager::processUdpGoodbye(const nlohmann::json& msg)
+{
+    std::string peerId = msg.value("n", "");
+    if (peerId.empty() || peerId == m_nodeId)
+        return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto it = m_nodes.find(peerId);
+    if (it == m_nodes.end())
+        return;
+
+    auto& info = it->second;
+    if (!info.isDead)
+    {
+        info.isDead = true;
+        info.reclaimEligible = true;  // chunks can be reassigned immediately
+        info.hasUdpContact = false;
+        info.heartbeat.node_state = "stopped";
+        MonitorLog::instance().info("health", "Node goodbye: " + peerId);
+    }
+}
+
 // --- Background thread ---
 
 void HeartbeatManager::threadFunc()
@@ -349,9 +372,23 @@ void HeartbeatManager::detectStaleness()
             }
         }
 
-        // UDP contact timeout: if no UDP heartbeat for 15s, fall back to filesystem detection
-        if (info.hasUdpContact && (nowMs() - info.lastUdpContactMs > 15000))
-            info.hasUdpContact = false;
+        // UDP fast dead detection: if we had UDP contact and lost it for 10s,
+        // the node is almost certainly down — fast-track to dead without waiting
+        // for the slower filesystem stale count to accumulate.
+        if (info.hasUdpContact)
+        {
+            int64_t udpSilenceMs = nowMs() - info.lastUdpContactMs;
+            if (udpSilenceMs > 15000)
+            {
+                info.hasUdpContact = false;
+            }
+            if (udpSilenceMs > 10000 && !info.isDead)
+            {
+                info.isDead = true;
+                info.reclaimEligible = false; // grace period: one more scan
+                MonitorLog::instance().warn("health", "Node DEAD (UDP lost): " + id);
+            }
+        }
     }
 }
 

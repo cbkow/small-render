@@ -83,11 +83,9 @@ void NodePanel::renderLocalNode()
     else
         ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.3f, 1.0f), "[Idle]");
 
+    // Role badges on their own line
     if (hb.is_coordinator)
-    {
-        ImGui::SameLine();
         ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.0f, 1.0f), "[Coordinator]");
-    }
 
     if (hb.render_state == "rendering" && !hb.active_job.empty())
     {
@@ -206,16 +204,16 @@ void NodePanel::renderPeerList()
         else
             ImGui::TextUnformatted(hb.hostname.c_str());
 
-        if (hb.is_coordinator)
+        // Role badges on their own line
+        if (hb.is_coordinator || peer->hasUdpContact)
         {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.0f, 1.0f), "[Coordinator]");
-        }
-
-        if (peer->hasUdpContact)
-        {
-            ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "[UDP]");
+            if (hb.is_coordinator)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.0f, 1.0f), "[Coordinator]");
+                if (peer->hasUdpContact) ImGui::SameLine();
+            }
+            if (peer->hasUdpContact)
+                ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "[UDP]");
         }
 
         // Hardware summary + version

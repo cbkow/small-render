@@ -1,9 +1,9 @@
 #include "monitor/ui/job_detail_panel.h"
 #include "monitor/monitor_app.h"
 #include "monitor/template_manager.h"
+#include "monitor/ui_data_cache.h"
 #include "core/platform.h"
 #include "core/job_types.h"
-#include "core/atomic_file_io.h"
 
 #include "monitor/ui/style.h"
 
@@ -13,7 +13,6 @@
 #include <cstring>
 #include <ctime>
 #include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <sstream>
 
@@ -42,6 +41,8 @@ void JobDetailPanel::render()
         m_hasTimeout = false;
         m_errors.clear();
         m_detailJobId.clear();
+        m_hasCachedDetailJob = false;
+        m_cachedFrameState = {};
 
         // Pre-fill from CLI submit request if present
         if (m_app->hasPendingSubmitRequest())
@@ -49,7 +50,7 @@ void JobDetailPanel::render()
             auto req = m_app->consumeSubmitRequest();
 
             // Find and select the matching template
-            const auto& templates = m_app->templateManager().templates();
+            const auto& templates = m_app->cachedTemplates();
             for (int i = 0; i < (int)templates.size(); ++i)
             {
                 if (!req.templateId.empty() && templates[i].template_id == req.templateId && templates[i].valid)
@@ -110,7 +111,7 @@ void JobDetailPanel::render()
     {
         m_mode = Mode::Detail;
         m_detailJobId = m_app->selectedJobId();
-        m_frameStatesJobId.clear(); // force rescan
+        m_cachedFrameState = {};  // clear stale data from previous job
     }
 
     if (ImGui::Begin("Job Detail", nullptr, ImGuiWindowFlags_NoTitleBar))
@@ -145,7 +146,7 @@ void JobDetailPanel::renderSubmission()
     if (Fonts::bold) ImGui::PopFont();
     ImGui::Separator();
 
-    const auto& templates = m_app->templateManager().templates();
+    const auto& templates = m_app->cachedTemplates();
 
     // --- Template ---
     if (Fonts::bold) ImGui::PushFont(Fonts::bold);
@@ -529,33 +530,39 @@ void JobDetailPanel::renderSubmission()
 
 void JobDetailPanel::renderDetail()
 {
-    // Find job by id
-    const auto& jobs = m_app->jobManager().jobs();
-    const JobInfo* found = nullptr;
+    // Find job by id — update cached copy when found, use stale copy on transient gaps
+    const auto& jobs = m_app->cachedJobs();
     for (const auto& j : jobs)
     {
         if (j.manifest.job_id == m_detailJobId)
         {
-            found = &j;
+            m_cachedDetailJob = j;
+            m_hasCachedDetailJob = true;
             break;
         }
     }
 
-    if (!found)
+    if (!m_hasCachedDetailJob || m_cachedDetailJob.manifest.job_id != m_detailJobId)
     {
         ImGui::TextDisabled("Job not found: %s", m_detailJobId.c_str());
         if (ImGui::Button("Clear"))
         {
             m_mode = Mode::Empty;
             m_detailJobId.clear();
+            m_hasCachedDetailJob = false;
         }
         return;
     }
 
-    const auto& manifest = found->manifest;
+    // Refresh cached frame state snapshot (keep last-known-good to avoid flicker)
+    {
+        auto snap = m_app->uiDataCache().getFrameStateSnapshot();
+        if (snap.jobId == m_detailJobId && !snap.frameStates.empty())
+            m_cachedFrameState = std::move(snap);
+    }
 
-    // Scan frame states (with cooldown)
-    scanFrameStates(m_detailJobId, manifest);
+    const JobInfo* found = &m_cachedDetailJob;
+    const auto& manifest = found->manifest;
 
     // Header
     ImGui::TextUnformatted(manifest.job_id.c_str());
@@ -771,111 +778,26 @@ void JobDetailPanel::renderDetail()
     }
 }
 
-// ─── Frame state scanning ────────────────────────────────────────────────────
-
-void JobDetailPanel::scanFrameStates(const std::string& jobId, const JobManifest& manifest)
-{
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastFrameScan).count();
-    if (m_frameStatesJobId == jobId && elapsed < FRAME_SCAN_COOLDOWN_MS)
-        return;
-
-    m_lastFrameScan = now;
-    m_frameStatesJobId = jobId;
-
-    int totalFrames = manifest.frame_end - manifest.frame_start + 1;
-
-    // Read dispatch.json — keep last good state on failed reads (race with sync layer)
-    auto dispatchPath = m_app->farmPath() / "jobs" / jobId / "dispatch.json";
-    auto data = AtomicFileIO::safeReadJson(dispatchPath);
-    if (!data.has_value())
-        return;
-
-    m_frameStates.assign(totalFrames, FrameState{});
-
-    try
-    {
-        DispatchTable dt = data.value().get<DispatchTable>();
-
-        for (const auto& dc : dt.chunks)
-        {
-            ChunkState cs = ChunkState::Unclaimed;
-            if (dc.state == "assigned")        cs = ChunkState::Rendering;
-            else if (dc.state == "completed")  cs = ChunkState::Completed;
-            else if (dc.state == "failed")     cs = ChunkState::Failed;
-
-            for (int f = dc.frame_start; f <= dc.frame_end; ++f)
-            {
-                int idx = f - manifest.frame_start;
-                if (idx >= 0 && idx < totalFrames)
-                {
-                    m_frameStates[idx].state = cs;
-                    m_frameStates[idx].ownerNodeId = dc.assigned_to;
-                }
-            }
-        }
-
-        m_dispatchChunks = std::move(dt.chunks);
-
-        // Scan event files for per-frame completions within "assigned" chunks
-        auto eventsBaseDir = m_app->farmPath() / "jobs" / jobId / "events";
-        std::error_code ec2;
-        if (std::filesystem::is_directory(eventsBaseDir, ec2))
-        {
-            for (const auto& nodeDir : std::filesystem::directory_iterator(eventsBaseDir, ec2))
-            {
-                if (!nodeDir.is_directory(ec2)) continue;
-                for (const auto& entry : std::filesystem::directory_iterator(nodeDir.path(), ec2))
-                {
-                    if (entry.path().extension() != ".json") continue;
-                    std::string stem = entry.path().stem().string();
-                    if (stem.find("_frame_finished_") == std::string::npos) continue;
-
-                    // Parse frame from filename: {seq}_frame_finished_{NNNNNN}-{NNNNNN}
-                    auto pos = stem.find("_frame_finished_") + 16;
-                    auto dash = stem.find('-', pos);
-                    if (dash == std::string::npos) continue;
-                    try
-                    {
-                        int frameNum = std::stoi(stem.substr(pos, dash - pos));
-                        int idx = frameNum - manifest.frame_start;
-                        if (idx >= 0 && idx < totalFrames &&
-                            m_frameStates[idx].state == ChunkState::Rendering)
-                        {
-                            m_frameStates[idx].state = ChunkState::Completed;
-                        }
-                    }
-                    catch (...) {}
-                }
-            }
-        }
-    }
-    catch (...)
-    {
-        // Parse failed — keep previous good state
-    }
-}
-
-// ─── Job progress ────────────────────────────────────────────────────────────
+// ─── Job progress (from UIDataCache) ─────────────────────────────────────────
 
 void JobDetailPanel::renderJobProgress(const JobManifest& /*manifest*/)
 {
-    if (m_frameStates.empty())
+    const auto& fs = m_cachedFrameState;
+    if (fs.jobId != m_detailJobId || fs.frameStates.empty())
     {
         ImGui::TextDisabled("No frame data");
         return;
     }
 
-    int total = (int)m_frameStates.size();
+    int total = (int)fs.frameStates.size();
     int completed = 0, rendering = 0, failed = 0;
-    for (const auto& fs : m_frameStates)
+    for (const auto& [frame, state] : fs.frameStates)
     {
-        if (fs.state == ChunkState::Completed) ++completed;
-        else if (fs.state == ChunkState::Rendering) ++rendering;
-        else if (fs.state == ChunkState::Failed) ++failed;
+        if (state == "completed") ++completed;
+        else if (state == "rendering") ++rendering;
+        else if (state == "failed") ++failed;
     }
 
-    // Summary text
     std::string summary = std::to_string(completed) + "/" + std::to_string(total) + " frames completed";
     if (rendering > 0)
         summary += "  |  " + std::to_string(rendering) + " rendering";
@@ -883,19 +805,29 @@ void JobDetailPanel::renderJobProgress(const JobManifest& /*manifest*/)
         summary += "  |  " + std::to_string(failed) + " failed";
     ImGui::TextUnformatted(summary.c_str());
 
-    // Progress bar
     float fraction = total > 0 ? (float)completed / (float)total : 0.0f;
     ImGui::ProgressBar(fraction, ImVec2(-1, 0));
 }
 
-// ─── Frame grid ──────────────────────────────────────────────────────────────
+// ─── Frame grid (from UIDataCache) ───────────────────────────────────────────
 
 void JobDetailPanel::renderFrameGrid(const JobManifest& manifest)
 {
-    if (m_frameStates.empty())
+    const auto& fsSnap = m_cachedFrameState;
+    if (fsSnap.jobId != m_detailJobId || fsSnap.frameStates.empty())
         return;
 
-    int totalFrames = (int)m_frameStates.size();
+    // Build indexed array from frame→state pairs
+    int totalFrames = manifest.frame_end - manifest.frame_start + 1;
+    struct FrameInfo { std::string state = "unclaimed"; };
+    std::vector<FrameInfo> frameInfos(totalFrames);
+    for (const auto& [frame, state] : fsSnap.frameStates)
+    {
+        int idx = frame - manifest.frame_start;
+        if (idx >= 0 && idx < totalFrames)
+            frameInfos[idx].state = state;
+    }
+
     float cellSize = 14.0f;
     float gap = 2.0f;
     float availWidth = ImGui::GetContentRegionAvail().x;
@@ -911,23 +843,17 @@ void JobDetailPanel::renderFrameGrid(const JobManifest& manifest)
         float x = origin.x + col * (cellSize + gap);
         float y = origin.y + row * (cellSize + gap);
 
-        // Cell color based on state
         ImU32 color;
-        switch (m_frameStates[i].state)
-        {
-            case ChunkState::Rendering:  color = IM_COL32(77, 128, 230, 255); break;
-            case ChunkState::Completed:  color = IM_COL32(77, 204, 77, 255);  break;
-            case ChunkState::Failed:     color = IM_COL32(230, 77, 77, 255);  break;
-            case ChunkState::Abandoned:  color = IM_COL32(153, 128, 51, 255); break;
-            default:                     color = IM_COL32(64, 64, 64, 255);   break;
-        }
+        const auto& st = frameInfos[i].state;
+        if (st == "rendering")       color = IM_COL32(77, 128, 230, 255);
+        else if (st == "completed")  color = IM_COL32(77, 204, 77, 255);
+        else if (st == "failed")     color = IM_COL32(230, 77, 77, 255);
+        else                         color = IM_COL32(64, 64, 64, 255);
 
         drawList->AddRectFilled(ImVec2(x, y), ImVec2(x + cellSize, y + cellSize), color);
     }
 
-    // Invisible buttons for click detection + tooltips
     int totalRows = (totalFrames + cols - 1) / cols;
-    ImVec2 gridSize(availWidth, totalRows * (cellSize + gap));
 
     ImGui::PushID("##framegrid");
     for (int i = 0; i < totalFrames; ++i)
@@ -944,32 +870,16 @@ void JobDetailPanel::renderFrameGrid(const JobManifest& manifest)
         int frameNum = manifest.frame_start + i;
 
         if (ImGui::IsItemHovered())
-        {
-            const char* stateStr = "unclaimed";
-            switch (m_frameStates[i].state)
-            {
-                case ChunkState::Rendering: stateStr = "rendering"; break;
-                case ChunkState::Completed: stateStr = "completed"; break;
-                case ChunkState::Failed:    stateStr = "failed";    break;
-                case ChunkState::Abandoned: stateStr = "abandoned"; break;
-                default: break;
-            }
-            if (!m_frameStates[i].ownerNodeId.empty())
-                ImGui::SetTooltip("Frame %d: %s (%s)", frameNum, stateStr,
-                                  m_frameStates[i].ownerNodeId.c_str());
-            else
-                ImGui::SetTooltip("Frame %d: %s", frameNum, stateStr);
-        }
+            ImGui::SetTooltip("Frame %d: %s", frameNum, frameInfos[i].state.c_str());
 
         ImGui::PopID();
     }
     ImGui::PopID();
 
-    // Advance cursor past the grid
     ImGui::SetCursorScreenPos(ImVec2(origin.x, origin.y + totalRows * (cellSize + gap) + 4.0f));
 }
 
-// ─── Chunk table ─────────────────────────────────────────────────────────────
+// ─── Chunk table (from UIDataCache) ──────────────────────────────────────────
 
 std::string JobDetailPanel::hostnameForNodeId(const std::string& nodeId) const
 {
@@ -985,7 +895,10 @@ std::string JobDetailPanel::hostnameForNodeId(const std::string& nodeId) const
 
 void JobDetailPanel::renderChunkTable(const JobManifest& /*manifest*/)
 {
-    if (m_dispatchChunks.empty())
+    const auto& fsSnap = m_cachedFrameState;
+    const auto& dispatchChunks = fsSnap.chunks;
+
+    if (fsSnap.jobId != m_detailJobId || dispatchChunks.empty())
     {
         ImGui::TextDisabled("No dispatch data");
         return;
@@ -997,7 +910,7 @@ void JobDetailPanel::renderChunkTable(const JobManifest& /*manifest*/)
     if (!ImGui::BeginTable("##chunks", numCols,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
             ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY,
-            ImVec2(0, (std::min)(200.0f, m_dispatchChunks.size() * 24.0f + 28.0f))))
+            ImVec2(0, (std::min)(200.0f, dispatchChunks.size() * 24.0f + 28.0f))))
         return;
 
     ImGui::TableSetupColumn("Range", ImGuiTableColumnFlags_WidthFixed, 90.0f);
@@ -1011,9 +924,9 @@ void JobDetailPanel::renderChunkTable(const JobManifest& /*manifest*/)
     auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 
-    for (int i = 0; i < (int)m_dispatchChunks.size(); ++i)
+    for (int i = 0; i < (int)dispatchChunks.size(); ++i)
     {
-        const auto& dc = m_dispatchChunks[i];
+        const auto& dc = dispatchChunks[i];
         ImGui::PushID(i);
         ImGui::TableNextRow();
 
@@ -1119,7 +1032,7 @@ void JobDetailPanel::onTemplateSelected(int idx)
     m_selectedTemplateIdx = idx;
     m_errors.clear();
 
-    const auto& templates = m_app->templateManager().templates();
+    const auto& templates = m_app->cachedTemplates();
     if (idx < 0 || idx >= (int)templates.size())
         return;
 
@@ -1251,7 +1164,7 @@ void JobDetailPanel::doSubmit()
 {
     m_errors.clear();
 
-    const auto& templates = m_app->templateManager().templates();
+    const auto& templates = m_app->cachedTemplates();
     if (m_selectedTemplateIdx < 0 || m_selectedTemplateIdx >= (int)templates.size())
     {
         m_errors.push_back("No template selected");

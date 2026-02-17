@@ -78,6 +78,7 @@ void CommandManager::sendCommand(const std::string& targetNodeId,
 
     std::string msgId = std::to_string(now) + "." + m_nodeId;
     j["msg_id"] = msgId;
+    j["target"] = targetNodeId;
 
     std::string filename = msgId + ".json";
     AtomicFileIO::writeJson(targetDir / filename, j);

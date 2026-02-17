@@ -124,6 +124,20 @@ void RenderCoordinator::abortCurrentRender(const std::string& reason)
     failChunk(reason);
 }
 
+void RenderCoordinator::purgeJob(const std::string& jobId)
+{
+    std::lock_guard<std::mutex> lock(m_queueMutex);
+    std::queue<PendingDispatch> keep;
+    while (!m_dispatchQueue.empty())
+    {
+        auto& item = m_dispatchQueue.front();
+        if (item.manifest.job_id != jobId)
+            keep.push(std::move(item));
+        m_dispatchQueue.pop();
+    }
+    m_dispatchQueue = std::move(keep);
+}
+
 void RenderCoordinator::setStopped(bool stopped)
 {
     m_stopped = stopped;

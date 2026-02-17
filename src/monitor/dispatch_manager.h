@@ -66,6 +66,10 @@ public:
 
     bool isRunning() const { return m_running; }
 
+    // Main-thread accessor for in-memory dispatch tables (coordinator only).
+    // Safe to call from main thread only; MonitorApp copies data for UIDataCache.
+    const std::map<std::string, DispatchTable>& getDispatchTables() const { return m_dispatchTables; }
+
 private:
     // Dispatch cycle steps
     void processLocalCompletions();

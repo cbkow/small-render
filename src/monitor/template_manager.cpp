@@ -1,6 +1,7 @@
 #include "monitor/template_manager.h"
 #include "core/atomic_file_io.h"
 #include "core/platform.h"
+#include "core/monitor_log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -11,38 +12,104 @@
 
 namespace SR {
 
-void TemplateManager::scan(const std::filesystem::path& farmPath)
+TemplateManager::~TemplateManager()
 {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastScan).count();
-    if (elapsed < SCAN_COOLDOWN_MS)
-        return;
-    m_lastScan = now;
+    stop();
+}
 
-    m_templates.clear();
+void TemplateManager::start(const std::filesystem::path& farmPath)
+{
+    if (m_running.load()) return;
+
+    m_farmPath = farmPath;
+
+    // First scan synchronous — data available immediately
+    auto result = doScan();
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_templates = std::move(result);
+    }
+
+    m_running.store(true);
+    m_thread = std::thread(&TemplateManager::threadFunc, this);
+}
+
+void TemplateManager::stop()
+{
+    m_running.store(false);
+    if (m_thread.joinable())
+        m_thread.join();
+}
+
+void TemplateManager::threadFunc()
+{
+    auto lastScan = std::chrono::steady_clock::now();
+
+    while (m_running.load())
+    {
+        for (int i = 0; i < 10 && m_running.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        if (!m_running.load()) break;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastScan).count();
+        if (elapsed < SCAN_COOLDOWN_MS)
+            continue;
+
+        lastScan = now;
+
+        try
+        {
+            auto result = doScan();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_templates = std::move(result);
+        }
+        catch (const std::exception& e)
+        {
+            MonitorLog::instance().error("farm", std::string("Template scan exception: ") + e.what());
+        }
+        catch (...)
+        {
+            MonitorLog::instance().error("farm", "Template scan unknown exception");
+        }
+    }
+}
+
+std::vector<JobTemplate> TemplateManager::doScan()
+{
+    std::vector<JobTemplate> templates;
 
     // Load examples first, then user templates
-    loadTemplatesFromDir(farmPath / "templates" / "examples", true);
-    loadTemplatesFromDir(farmPath / "templates", false);
+    loadTemplatesFromDir(m_farmPath / "templates" / "examples", true, templates);
+    loadTemplatesFromDir(m_farmPath / "templates", false, templates);
 
     // User templates with same template_id override examples
     std::set<std::string> userIds;
-    for (const auto& t : m_templates)
+    for (const auto& t : templates)
     {
         if (!t.isExample)
             userIds.insert(t.template_id);
     }
 
-    // Remove example templates that have a user override
-    m_templates.erase(
-        std::remove_if(m_templates.begin(), m_templates.end(),
+    templates.erase(
+        std::remove_if(templates.begin(), templates.end(),
             [&](const JobTemplate& t) {
                 return t.isExample && userIds.count(t.template_id) > 0;
             }),
-        m_templates.end());
+        templates.end());
+
+    return templates;
 }
 
-void TemplateManager::loadTemplatesFromDir(const std::filesystem::path& dir, bool isExample)
+std::vector<JobTemplate> TemplateManager::getTemplateSnapshot() const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_templates;
+}
+
+void TemplateManager::loadTemplatesFromDir(const std::filesystem::path& dir, bool isExample,
+                                            std::vector<JobTemplate>& out)
 {
     namespace fs = std::filesystem;
     std::error_code ec;
@@ -68,7 +135,7 @@ void TemplateManager::loadTemplatesFromDir(const std::filesystem::path& dir, boo
             invalid.valid = false;
             invalid.validation_error = "Failed to parse JSON";
             invalid.isExample = isExample;
-            m_templates.push_back(std::move(invalid));
+            out.push_back(std::move(invalid));
             continue;
         }
 
@@ -77,7 +144,7 @@ void TemplateManager::loadTemplatesFromDir(const std::filesystem::path& dir, boo
             auto tmpl = data.value().get<JobTemplate>();
             tmpl.isExample = isExample;
             validateTemplate(tmpl);
-            m_templates.push_back(std::move(tmpl));
+            out.push_back(std::move(tmpl));
         }
         catch (const std::exception& e)
         {
@@ -87,7 +154,7 @@ void TemplateManager::loadTemplatesFromDir(const std::filesystem::path& dir, boo
             invalid.valid = false;
             invalid.validation_error = std::string("Parse error: ") + e.what();
             invalid.isExample = isExample;
-            m_templates.push_back(std::move(invalid));
+            out.push_back(std::move(invalid));
         }
     }
 }

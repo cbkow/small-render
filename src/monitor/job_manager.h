@@ -7,16 +7,27 @@
 #include <string>
 #include <chrono>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
 namespace SR {
 
 class JobManager
 {
 public:
-    void scan(const std::filesystem::path& farmPath);
-    const std::vector<JobInfo>& jobs() const { return m_jobs; }
+    ~JobManager();
 
-    // Thread-safe snapshot for DispatchManager
+    JobManager() = default;
+    JobManager(const JobManager&) = delete;
+    JobManager& operator=(const JobManager&) = delete;
+
+    // Start background scanning thread. First scan is synchronous.
+    void start(const std::filesystem::path& farmPath);
+
+    // Stop background thread.
+    void stop();
+
+    // Thread-safe snapshot for UI / DispatchManager
     std::vector<JobInfo> getJobSnapshot() const;
 
     std::string submitJob(const std::filesystem::path& farmPath,
@@ -31,13 +42,16 @@ public:
     void invalidate();
 
 private:
-    void scanImpl(const std::filesystem::path& farmPath);
+    void threadFunc();
+    std::vector<JobInfo> doScan();
 
+    std::filesystem::path m_farmPath;
     std::vector<JobInfo> m_jobs;
     mutable std::mutex m_mutex;
-    std::chrono::steady_clock::time_point m_lastScan{};
+    std::atomic<bool> m_running{false};
+    std::atomic<bool> m_invalidated{true};
+    std::thread m_thread;
     static constexpr int SCAN_COOLDOWN_MS = 3000;
-    bool m_invalidated = true;
 };
 
 } // namespace SR

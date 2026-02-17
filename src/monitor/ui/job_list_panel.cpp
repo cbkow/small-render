@@ -1,58 +1,17 @@
 #include "monitor/ui/job_list_panel.h"
 #include "monitor/ui/style.h"
 #include "monitor/monitor_app.h"
-#include "core/atomic_file_io.h"
+#include "monitor/ui_data_cache.h"
 
 #include <imgui.h>
 #include <ctime>
 #include <cstring>
-#include <filesystem>
 
 namespace SR {
 
 void JobListPanel::init(MonitorApp* app)
 {
     m_app = app;
-}
-
-void JobListPanel::scanJobProgress()
-{
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastProgressScan).count();
-    if (elapsed < PROGRESS_SCAN_COOLDOWN_MS)
-        return;
-
-    m_lastProgressScan = now;
-
-    const auto& jobs = m_app->jobManager().jobs();
-    for (const auto& job : jobs)
-    {
-        const auto& manifest = job.manifest;
-        int totalFrames = manifest.frame_end - manifest.frame_start + 1;
-
-        // Read dispatch.json — skip on failed read to keep last good value
-        auto dispatchPath = m_app->farmPath() / "jobs" / manifest.job_id / "dispatch.json";
-        auto data = AtomicFileIO::safeReadJson(dispatchPath);
-        if (!data.has_value())
-            continue;
-
-        JobProgress prog;
-        prog.total = totalFrames;
-        prog.completed = 0;
-
-        try
-        {
-            DispatchTable dt = data.value().get<DispatchTable>();
-            for (const auto& dc : dt.chunks)
-            {
-                if (dc.state == "completed")
-                    prog.completed += (dc.frame_end - dc.frame_start + 1);
-            }
-        }
-        catch (...) {}
-
-        m_progressCache[manifest.job_id] = prog;
-    }
 }
 
 static bool isDeletableState(const std::string& state)
@@ -74,15 +33,15 @@ void JobListPanel::render()
             return;
         }
 
-        // Scan progress
-        scanJobProgress();
+        // Get progress from UIDataCache (zero FS I/O)
+        auto progressMap = m_app->uiDataCache().getProgressSnapshot();
 
         // New Job button
         if (ImGui::Button("New Job"))
             m_app->requestSubmissionMode();
 
         // Toolbar: bulk action buttons
-        const auto& jobs = m_app->jobManager().jobs();
+        const auto& jobs = m_app->cachedJobs();
         int deletableCount = 0;
         int cancellableCount = 0;
         for (const auto& id : m_selectedJobIds)
@@ -112,6 +71,20 @@ void JobListPanel::render()
             snprintf(delLabel, sizeof(delLabel), "Delete (%d)", deletableCount);
             if (ImGui::Button(delLabel))
                 m_pendingBulkDelete = true;
+        }
+
+        // Cancel All panic button — visible whenever any job is active/paused
+        int totalActive = 0;
+        for (const auto& j : jobs)
+        {
+            if (j.current_state == "active" || j.current_state == "paused")
+                ++totalActive;
+        }
+        if (totalActive > 0)
+        {
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel All"))
+                m_pendingCancelAll = true;
         }
 
         ImGui::SameLine();
@@ -241,8 +214,8 @@ void JobListPanel::render()
 
                     // Progress
                     ImGui::TableNextColumn();
-                    auto progIt = m_progressCache.find(jobId);
-                    if (progIt != m_progressCache.end() && progIt->second.total > 0)
+                    auto progIt = progressMap.find(jobId);
+                    if (progIt != progressMap.end() && progIt->second.total > 0)
                     {
                         float frac = (float)progIt->second.completed / (float)progIt->second.total;
                         float avail = ImGui::GetContentRegionAvail().x;
@@ -326,6 +299,39 @@ void JobListPanel::render()
                 }
                 ImGui::CloseCurrentPopup();
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Back"))
+                ImGui::CloseCurrentPopup();
+
+            ImGui::EndPopup();
+        }
+
+        // Cancel All confirmation popup
+        if (m_pendingCancelAll)
+        {
+            ImGui::OpenPopup("Confirm Cancel All");
+            m_pendingCancelAll = false;
+        }
+
+        if (ImGui::BeginPopupModal("Confirm Cancel All", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::Text("Cancel ALL %d active/paused job%s?",
+                         totalActive, totalActive == 1 ? "" : "s");
+            ImGui::Text("All running renders will be aborted.");
+
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+            if (ImGui::Button("Cancel All Jobs"))
+            {
+                for (const auto& j : jobs)
+                {
+                    if (j.current_state == "active" || j.current_state == "paused")
+                        m_app->cancelJob(j.manifest.job_id);
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::PopStyleColor(2);
             ImGui::SameLine();
             if (ImGui::Button("Back"))
                 ImGui::CloseCurrentPopup();

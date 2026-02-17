@@ -1,5 +1,6 @@
 #include "monitor/monitor_app.h"
 #include "monitor/farm_init.h"
+#include "monitor/ui_data_cache.h"
 #include "core/platform.h"
 #include "core/atomic_file_io.h"
 #include "core/monitor_log.h"
@@ -26,6 +27,9 @@ bool MonitorApp::init()
 
     // Apply saved font scale
     ImGui::GetIO().FontGlobalScale = m_config.font_scale;
+
+    // Create UIDataCache (will be started/stopped with farm)
+    m_uiDataCache = std::make_unique<UIDataCache>();
 
     // Initialize agent supervisor (IPC server + background thread)
     m_agentSupervisor.start(m_identity.nodeId());
@@ -87,8 +91,22 @@ void MonitorApp::update()
                 m_lastDedupPurge = now;
             }
 
-            m_templateManager.scan(m_farmPath);
-            m_jobManager.scan(m_farmPath);
+            // Refresh cached snapshots from bg threads (zero FS I/O)
+            m_cachedJobs = m_jobManager.getJobSnapshot();
+            m_cachedTemplates = m_templateManager.getTemplateSnapshot();
+
+            // Push context to UIDataCache bg thread
+            {
+                std::vector<std::string> jobIds;
+                jobIds.reserve(m_cachedJobs.size());
+                for (const auto& j : m_cachedJobs)
+                    jobIds.push_back(j.manifest.job_id);
+                m_uiDataCache->setJobIds(jobIds);
+                m_uiDataCache->setSelectedJobId(m_selectedJobId);
+
+                if (m_config.is_coordinator)
+                    m_uiDataCache->setDispatchTables(m_dispatchManager.getDispatchTables());
+            }
 
             if (m_config.is_coordinator)
             {
@@ -97,6 +115,10 @@ void MonitorApp::update()
             }
 
             m_renderCoordinator.update(m_agentSupervisor);
+
+            // Worker: retry deferred assignments waiting for manifest propagation
+            if (!m_config.is_coordinator)
+                processDeferredAssignments();
 
             // Worker: retry sending buffered completions when coordinator is back
             if (!m_config.is_coordinator && !m_pendingCompletions.empty())
@@ -233,6 +255,15 @@ bool MonitorApp::startFarm()
 
     m_farmPath = result.farmPath;
     MonitorLog::instance().startFileLogging(m_farmPath, m_identity.nodeId());
+
+    // Start bg scanning threads (first scan synchronous = data ready before DispatchManager)
+    m_jobManager.start(m_farmPath);
+    m_templateManager.start(m_farmPath);
+
+    // Populate caches immediately
+    m_cachedJobs = m_jobManager.getJobSnapshot();
+    m_cachedTemplates = m_templateManager.getTemplateSnapshot();
+
     m_heartbeatManager.setIsCoordinator(m_config.is_coordinator);
     m_heartbeatManager.start(m_farmPath, m_identity, m_config.timing, m_config.tags);
 
@@ -299,7 +330,9 @@ bool MonitorApp::startFarm()
         m_submissionManager.start(
             m_farmPath, m_identity.nodeId(), getOS(),
             [this](const std::string& templateId) -> std::optional<JobTemplate> {
-                for (const auto& t : m_templateManager.templates())
+                // Use thread-safe snapshot (called from SubmissionManager bg thread)
+                auto templates = m_templateManager.getTemplateSnapshot();
+                for (const auto& t : templates)
                 {
                     if (t.template_id == templateId && t.valid)
                         return t;
@@ -341,7 +374,14 @@ bool MonitorApp::startFarm()
         }
     );
 
+    // Start UIDataCache bg thread
+    m_uiDataCache->start(m_farmPath);
+
     m_farmRunning = true;
+
+    // Announce presence immediately so peers discover us within ~50ms
+    sendUdpHeartbeat();
+    m_lastUdpHeartbeat = std::chrono::steady_clock::now();
 
     MonitorLog::instance().info("farm", "Farm started at: " + m_farmPath.string());
     return true;
@@ -351,6 +391,18 @@ void MonitorApp::stopFarm()
 {
     if (!m_farmRunning)
         return;
+
+    // Broadcast goodbye so peers/coordinator know immediately
+    if (m_udpNotify.isRunning())
+    {
+        m_udpNotify.send({
+            {"t", "bye"},
+            {"from", m_identity.nodeId()},
+            {"n", m_identity.nodeId()},
+        });
+    }
+
+    m_uiDataCache->stop();
 
     m_commandManager.setUdpNotify(nullptr);
     m_commandManager.stop();
@@ -362,6 +414,9 @@ void MonitorApp::stopFarm()
         m_submissionManager.stop();
     }
 
+    m_jobManager.stop();
+    m_templateManager.stop();
+
     m_heartbeatManager.stop();
     MonitorLog::instance().stopFileLogging();
     m_farmRunning = false;
@@ -369,6 +424,7 @@ void MonitorApp::stopFarm()
     m_farmError.clear();
     m_nodeState = NodeState::Active;
     m_pendingCompletions.clear();
+    m_deferredAssignments.clear();
 }
 
 // ─── Coordinator query ──────────────────────────────────────────────────────
@@ -398,6 +454,16 @@ void MonitorApp::handleUdpMessages()
             m_heartbeatManager.processUdpHeartbeat(msg);
             continue;
         }
+        if (type == "bye")
+        {
+            m_heartbeatManager.processUdpGoodbye(msg);
+            continue;
+        }
+
+        // Commands are targeted — ignore if not addressed to us
+        std::string target = msg.value("target", "");
+        if (!target.empty() && target != m_identity.nodeId())
+            continue;
 
         std::string msgId = msg.value("msg_id", "");
         if (msgId.empty() || m_dedup.isDuplicate(msgId))
@@ -449,6 +515,10 @@ void MonitorApp::processAction(const CommandManager::Action& action)
     {
         if (m_renderCoordinator.currentJobId() == action.jobId)
             m_renderCoordinator.abortCurrentRender("Coordinator abort: " + action.reason);
+        m_renderCoordinator.purgeJob(action.jobId);
+        // Clear deferred assignments for this job
+        std::erase_if(m_deferredAssignments,
+            [&](const DeferredAssignment& da) { return da.action.jobId == action.jobId; });
     }
     else if (action.type == "chunk_completed" || action.type == "chunk_failed")
     {
@@ -459,6 +529,10 @@ void MonitorApp::processAction(const CommandManager::Action& action)
     {
         if (m_renderCoordinator.currentJobId() == action.jobId)
             m_renderCoordinator.abortCurrentRender("Remote stop: " + action.reason);
+        m_renderCoordinator.purgeJob(action.jobId);
+        // Clear deferred assignments for this job
+        std::erase_if(m_deferredAssignments,
+            [&](const DeferredAssignment& da) { return da.action.jobId == action.jobId; });
     }
     else if (action.type == "stop_all")
     {
@@ -491,18 +565,15 @@ void MonitorApp::handleAssignChunk(const CommandManager::Action& action)
         return;
     }
 
-    // Read manifest from disk
+    // Read manifest from disk (may not have propagated across NAS yet)
     auto manifestPath = m_farmPath / "jobs" / action.jobId / "manifest.json";
     auto data = AtomicFileIO::safeReadJson(manifestPath);
     if (!data.has_value())
     {
-        MonitorLog::instance().error("farm", "Can't read manifest for assigned job: " + action.jobId);
-        std::string coordId = findCoordinatorNodeId();
-        if (!coordId.empty())
-        {
-            m_commandManager.sendCommand(coordId, "chunk_failed", action.jobId,
-                                         "manifest_read_failed", action.frameStart, action.frameEnd);
-        }
+        // Defer for retry — manifest likely hasn't synced from coordinator yet
+        m_deferredAssignments.push_back({action, 0,
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(500)});
+        MonitorLog::instance().info("farm", "Deferring assignment (manifest not yet available): " + action.jobId);
         return;
     }
 
@@ -549,6 +620,84 @@ void MonitorApp::flushPendingCompletions()
     m_pendingCompletions.clear();
 }
 
+// ─── Worker: process deferred assignments ────────────────────────────────────
+
+void MonitorApp::processDeferredAssignments()
+{
+    if (m_deferredAssignments.empty()) return;
+
+    auto now = std::chrono::steady_clock::now();
+    constexpr int MAX_RETRIES = 30; // 30 * 500ms = 15s max wait (covers cloud sync)
+
+    for (auto it = m_deferredAssignments.begin(); it != m_deferredAssignments.end(); )
+    {
+        if (now < it->nextRetry)
+        {
+            ++it;
+            continue;
+        }
+
+        // If we started rendering something else in the meantime, fail this one
+        if (m_renderCoordinator.isRendering())
+        {
+            std::string coordId = findCoordinatorNodeId();
+            if (!coordId.empty())
+            {
+                m_commandManager.sendCommand(coordId, "chunk_failed", it->action.jobId,
+                                             "worker_busy", it->action.frameStart, it->action.frameEnd);
+            }
+            it = m_deferredAssignments.erase(it);
+            continue;
+        }
+
+        auto manifestPath = m_farmPath / "jobs" / it->action.jobId / "manifest.json";
+        auto data = AtomicFileIO::safeReadJson(manifestPath);
+
+        if (data.has_value())
+        {
+            try
+            {
+                JobManifest manifest = data.value().get<JobManifest>();
+                ChunkRange chunk;
+                chunk.frame_start = it->action.frameStart;
+                chunk.frame_end = it->action.frameEnd;
+
+                m_renderCoordinator.queueDispatch(manifest, chunk);
+                MonitorLog::instance().info("farm", "Accepted deferred assignment: job=" + it->action.jobId +
+                    " chunk=" + chunk.rangeStr() + " (retry " + std::to_string(it->retryCount) + ")");
+            }
+            catch (const std::exception& e)
+            {
+                MonitorLog::instance().error("farm", "Failed to parse manifest: " + std::string(e.what()));
+                std::string coordId = findCoordinatorNodeId();
+                if (!coordId.empty())
+                {
+                    m_commandManager.sendCommand(coordId, "chunk_failed", it->action.jobId,
+                                                 "manifest_parse_failed", it->action.frameStart, it->action.frameEnd);
+                }
+            }
+            it = m_deferredAssignments.erase(it);
+        }
+        else if (++it->retryCount >= MAX_RETRIES)
+        {
+            MonitorLog::instance().error("farm", "Giving up on deferred assignment after " +
+                std::to_string(MAX_RETRIES) + " retries: " + it->action.jobId);
+            std::string coordId = findCoordinatorNodeId();
+            if (!coordId.empty())
+            {
+                m_commandManager.sendCommand(coordId, "chunk_failed", it->action.jobId,
+                                             "manifest_read_failed", it->action.frameStart, it->action.frameEnd);
+            }
+            it = m_deferredAssignments.erase(it);
+        }
+        else
+        {
+            it->nextRetry = now + std::chrono::milliseconds(500);
+            ++it;
+        }
+    }
+}
+
 // ─── Job controls ───────────────────────────────────────────────────────────
 
 void MonitorApp::pauseJob(const std::string& jobId)
@@ -557,7 +706,7 @@ void MonitorApp::pauseJob(const std::string& jobId)
 
     // Get current priority
     int priority = 50;
-    for (const auto& j : m_jobManager.jobs())
+    for (const auto& j : m_cachedJobs)
     {
         if (j.manifest.job_id == jobId)
         {
@@ -593,7 +742,7 @@ void MonitorApp::resumeJob(const std::string& jobId)
     if (!m_farmRunning) return;
 
     int priority = 50;
-    for (const auto& j : m_jobManager.jobs())
+    for (const auto& j : m_cachedJobs)
     {
         if (j.manifest.job_id == jobId)
         {
@@ -644,7 +793,7 @@ void MonitorApp::requeueJob(const std::string& jobId)
 
     // Find the source job
     const JobInfo* source = nullptr;
-    for (const auto& j : m_jobManager.jobs())
+    for (const auto& j : m_cachedJobs)
     {
         if (j.manifest.job_id == jobId)
         {
@@ -768,6 +917,10 @@ void MonitorApp::setNodeState(NodeState state)
         MonitorLog::instance().info("farm", "Node state: Stopped");
         break;
     }
+
+    // Immediately broadcast state change so peers see it within ~50ms
+    sendUdpHeartbeat();
+    m_lastUdpHeartbeat = std::chrono::steady_clock::now();
 }
 
 // ─── Tray state ─────────────────────────────────────────────────────────────

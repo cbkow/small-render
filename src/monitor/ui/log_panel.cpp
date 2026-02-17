@@ -1,13 +1,13 @@
 #include "monitor/ui/log_panel.h"
 #include "monitor/ui/style.h"
 #include "monitor/monitor_app.h"
+#include "monitor/ui_data_cache.h"
 #include "core/monitor_log.h"
 #include "core/platform.h"
 
 #include <imgui.h>
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
 
 namespace SR {
 
@@ -85,13 +85,11 @@ void LogPanel::render()
             {
                 m_mode = Mode::MonitorLog;
                 m_filterIdx = 0;
-                m_remoteCacheKey.clear();
             }
             if (ImGui::Selectable("All Nodes", m_mode == Mode::MonitorLog && m_filterIdx == 1))
             {
                 m_mode = Mode::MonitorLog;
                 m_filterIdx = 1;
-                m_remoteCacheKey.clear();
             }
 
             for (int i = 0; i < (int)m_peerHostnames.size(); ++i)
@@ -101,7 +99,6 @@ void LogPanel::render()
                 {
                     m_mode = Mode::MonitorLog;
                     m_filterIdx = i + 2;
-                    m_remoteCacheKey.clear();
                 }
             }
 
@@ -113,7 +110,6 @@ void LogPanel::render()
                 if (ImGui::Selectable(taskLabel.c_str(), m_mode == Mode::TaskOutput))
                 {
                     m_mode = Mode::TaskOutput;
-                    m_taskOutputJobId.clear(); // force reload
                 }
             }
 
@@ -193,36 +189,17 @@ void LogPanel::render()
                                        e.category.c_str(), e.message.c_str());
                 }
 
-                // Read + show peer log files (with cache)
+                // Read + show peer log files (from UIDataCache bg thread)
                 if (m_app->isFarmRunning())
                 {
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now - m_lastRemoteLoad).count();
-
-                    if (m_remoteCacheKey != "all" || elapsed >= REMOTE_RELOAD_MS)
-                    {
-                        m_remoteLines.clear();
-                        m_remoteCacheKey = "all";
-                        m_lastRemoteLoad = now;
-
-                        for (int i = 0; i < (int)m_peerNodeIds.size(); ++i)
-                        {
-                            auto lines = MonitorLog::readNodeLog(
-                                m_app->farmPath(), m_peerNodeIds[i], 200);
-                            for (auto& l : lines)
-                            {
-                                m_remoteLines.push_back(
-                                    "[" + m_peerHostnames[i] + "] " + l);
-                            }
-                        }
-                    }
+                    // Push log request to UIDataCache
+                    m_app->uiDataCache().setLogRequest("all", m_peerNodeIds);
+                    auto remoteSnap = m_app->uiDataCache().getRemoteLogSnapshot();
 
                     ImGui::Separator();
-                    for (const auto& line : m_remoteLines)
+                    for (const auto& line : remoteSnap.lines)
                     {
-                        // Color remote lines by level if parseable
-                        ImVec4 color(0.5f, 0.6f, 0.7f, 1.0f); // muted blue-gray
+                        ImVec4 color(0.5f, 0.6f, 0.7f, 1.0f);
                         if (line.find("WARN") != std::string::npos)
                             color = ImVec4(0.8f, 0.7f, 0.0f, 1.0f);
                         else if (line.find("ERROR") != std::string::npos)
@@ -238,20 +215,13 @@ void LogPanel::render()
                 int peerIdx = m_filterIdx - 2;
                 if (peerIdx >= 0 && peerIdx < (int)m_peerNodeIds.size() && m_app->isFarmRunning())
                 {
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        now - m_lastRemoteLoad).count();
+                    // Push log request to UIDataCache
+                    m_app->uiDataCache().setLogRequest(
+                        "peer:" + m_peerNodeIds[peerIdx],
+                        {m_peerNodeIds[peerIdx]});
+                    auto remoteSnap = m_app->uiDataCache().getRemoteLogSnapshot();
 
-                    std::string cacheKey = "peer:" + m_peerNodeIds[peerIdx];
-                    if (m_remoteCacheKey != cacheKey || elapsed >= REMOTE_RELOAD_MS)
-                    {
-                        m_remoteCacheKey = cacheKey;
-                        m_lastRemoteLoad = now;
-                        m_remoteLines = MonitorLog::readNodeLog(
-                            m_app->farmPath(), m_peerNodeIds[peerIdx], 500);
-                    }
-
-                    for (const auto& line : m_remoteLines)
+                    for (const auto& line : remoteSnap.lines)
                     {
                         ImVec4 color(0.7f, 0.7f, 0.7f, 1.0f);
                         if (line.find("WARN") != std::string::npos)
@@ -282,10 +252,6 @@ void LogPanel::render()
         if (ImGui::Button("Clear"))
         {
             MonitorLog::instance().clearEntries();
-            m_remoteLines.clear();
-            m_remoteCacheKey.clear();
-            m_taskOutputLines.clear();
-            m_taskOutputJobId.clear();
         }
         ImGui::SameLine();
         if (m_app->isFarmRunning())
@@ -325,7 +291,7 @@ void LogPanel::render()
     ImGui::End();
 }
 
-// ─── Task output (DCC stdout) ────────────────────────────────────────────────
+// ─── Task output (DCC stdout, from UIDataCache bg thread) ────────────────────
 
 void LogPanel::renderTaskOutput()
 {
@@ -336,108 +302,15 @@ void LogPanel::renderTaskOutput()
         return;
     }
 
-    // Reload on job change or cooldown expiry
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - m_lastTaskOutputLoad).count();
-    bool needsReload = (jobId != m_taskOutputJobId) || (elapsed >= TASK_OUTPUT_RELOAD_MS);
+    auto snap = m_app->uiDataCache().getTaskOutputSnapshot();
 
-    if (needsReload)
-    {
-        m_taskOutputJobId = jobId;
-        m_lastTaskOutputLoad = now;
-        m_taskOutputLines.clear();
-
-        namespace fs = std::filesystem;
-        std::error_code ec;
-        auto stdoutDir = m_app->farmPath() / "jobs" / jobId / "stdout";
-
-        struct LogFile
-        {
-            std::string nodeId;
-            std::string filename;
-            std::string rangeStr;
-            uint64_t timestamp_ms = 0;
-            fs::path path;
-        };
-        std::vector<LogFile> logFiles;
-
-        if (fs::is_directory(stdoutDir, ec))
-        {
-            for (auto& nodeEntry : fs::directory_iterator(stdoutDir, ec))
-            {
-                if (!nodeEntry.is_directory(ec)) continue;
-                std::string nodeId = nodeEntry.path().filename().string();
-
-                std::error_code ec2;
-                for (auto& fileEntry : fs::directory_iterator(nodeEntry.path(), ec2))
-                {
-                    if (!fileEntry.is_regular_file(ec2)) continue;
-                    if (fileEntry.path().extension() != ".log") continue;
-
-                    std::string fname = fileEntry.path().filename().string();
-
-                    // Parse: "{rangeStr}_{timestamp_ms}.log"
-                    auto lastUnderscore = fname.rfind('_');
-                    auto dotPos = fname.rfind('.');
-                    if (lastUnderscore == std::string::npos || dotPos == std::string::npos)
-                        continue;
-
-                    std::string rangeStr = fname.substr(0, lastUnderscore);
-                    std::string tsStr = fname.substr(lastUnderscore + 1,
-                                                     dotPos - lastUnderscore - 1);
-
-                    uint64_t ts = 0;
-                    try { ts = std::stoull(tsStr); }
-                    catch (...) { continue; }
-
-                    logFiles.push_back({nodeId, fname, rangeStr, ts, fileEntry.path()});
-                }
-            }
-        }
-
-        // Sort by range then timestamp (groups chunks together, retries in order)
-        std::sort(logFiles.begin(), logFiles.end(),
-                  [](const LogFile& a, const LogFile& b) {
-                      if (a.rangeStr != b.rangeStr) return a.rangeStr < b.rangeStr;
-                      return a.timestamp_ms < b.timestamp_ms;
-                  });
-
-        // Load file contents with headers
-        for (const auto& lf : logFiles)
-        {
-            // Format timestamp as HH:MM:SS
-            time_t secs = static_cast<time_t>(lf.timestamp_ms / 1000);
-            struct tm tmBuf;
-#ifdef _WIN32
-            localtime_s(&tmBuf, &secs);
-#else
-            localtime_r(&secs, &tmBuf);
-#endif
-            char timeBuf[16];
-            std::snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d",
-                          tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec);
-
-            std::string header = lf.nodeId + "  |  f" + lf.rangeStr + "  |  " + timeBuf;
-            m_taskOutputLines.push_back({header, true});
-
-            std::ifstream ifs(lf.path);
-            std::string line;
-            while (std::getline(ifs, line))
-                m_taskOutputLines.push_back({std::move(line), false});
-
-            m_taskOutputLines.push_back({"", false}); // blank separator
-        }
-    }
-
-    // Display
-    if (m_taskOutputLines.empty())
+    if (snap.lines.empty())
     {
         ImGui::TextDisabled("No task output available");
         return;
     }
 
-    for (const auto& tol : m_taskOutputLines)
+    for (const auto& tol : snap.lines)
     {
         if (tol.isHeader)
             ImGui::TextColored(ImVec4(0.4f, 0.7f, 1.0f, 1.0f), "%s", tol.text.c_str());

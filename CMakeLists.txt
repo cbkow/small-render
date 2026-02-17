@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SmallRender VERSION 0.1.1 LANGUAGES C CXX)
+project(SmallRender VERSION 0.1.4 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -77,6 +77,7 @@ add_executable(smallrender
     src/core/monitor_log.cpp
     src/core/system_tray.cpp
     src/core/single_instance.cpp
+    src/core/udp_notify.cpp
     src/monitor/main.cpp
     src/monitor/monitor_app.cpp
     src/monitor/agent_supervisor.cpp
@@ -88,6 +89,7 @@ add_executable(smallrender
     src/monitor/render_coordinator.cpp
     src/monitor/command_manager.cpp
     src/monitor/submission_manager.cpp
+    src/monitor/ui_data_cache.cpp
     src/monitor/ui/dashboard.cpp
     src/monitor/ui/settings_panel.cpp
     src/monitor/ui/node_panel.cpp
@@ -118,6 +120,7 @@ target_link_libraries(smallrender PRIVATE
     Rpcrt4
     dwmapi
     Advapi32
+    Ws2_32
 )
 
 # Copy resources/ next to the executable at build time

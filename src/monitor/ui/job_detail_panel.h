@@ -1,10 +1,10 @@
 #pragma once
 
 #include "core/job_types.h"
+#include "monitor/ui_data_cache.h"
 
 #include <string>
 #include <vector>
-#include <chrono>
 
 namespace SR {
 
@@ -47,20 +47,12 @@ private:
 
     // --- Detail state ---
     std::string m_detailJobId;
+    JobInfo m_cachedDetailJob;      // last-known-good for flicker prevention
+    bool m_hasCachedDetailJob = false;
+    UIDataCache::FrameStateSnapshot m_cachedFrameState; // last-known-good frame data
     bool m_pendingCancel = false;
     bool m_pendingRequeue = false;
     bool m_pendingDelete = false;
-
-    // --- Frame grid state ---
-    struct FrameState
-    {
-        ChunkState state = ChunkState::Unclaimed;
-        std::string ownerNodeId;
-    };
-    std::vector<FrameState> m_frameStates;
-    std::string m_frameStatesJobId;
-    std::chrono::steady_clock::time_point m_lastFrameScan{};
-    static constexpr int FRAME_SCAN_COOLDOWN_MS = 3000;
 
     void renderEmpty();
     void renderSubmission();
@@ -69,13 +61,11 @@ private:
     void doSubmit();
     std::string currentOS() const;
 
-    // Phase 8: frame grid + progress
-    void scanFrameStates(const std::string& jobId, const JobManifest& manifest);
+    // Phase 8: frame grid + progress (data from UIDataCache)
     void renderJobProgress(const JobManifest& manifest);
     void renderFrameGrid(const JobManifest& manifest);
 
     // Chunk table
-    std::vector<DispatchChunk> m_dispatchChunks;
     void renderChunkTable(const JobManifest& manifest);
     std::string hostnameForNodeId(const std::string& nodeId) const;
 };

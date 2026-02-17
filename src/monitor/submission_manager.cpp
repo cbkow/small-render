@@ -11,6 +11,11 @@ namespace SR {
 
 namespace fs = std::filesystem;
 
+SubmissionManager::~SubmissionManager()
+{
+    stop();
+}
+
 void SubmissionManager::start(const fs::path& farmPath,
                               const std::string& nodeId,
                               const std::string& os,
@@ -28,36 +33,72 @@ void SubmissionManager::start(const fs::path& farmPath,
     std::error_code ec;
     fs::create_directories(m_farmPath / "submissions" / "processed", ec);
 
+    // Start background thread
+    m_threadRunning.store(true);
+    m_thread = std::thread(&SubmissionManager::threadFunc, this);
+
     MonitorLog::instance().info("farm", "SubmissionManager started");
 }
 
 void SubmissionManager::stop()
 {
     m_running = false;
+    m_threadRunning.store(false);
+    if (m_thread.joinable())
+        m_thread.join();
 }
 
 void SubmissionManager::wakeUp()
 {
-    m_lastPoll = {};  // reset to epoch → immediate poll
+    m_wakeFlag.store(true);
 }
 
 void SubmissionManager::update()
 {
-    if (!m_running) return;
+    // No-op: all work done on bg thread now
+}
 
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastPoll).count();
-    if (elapsed < POLL_INTERVAL_MS) return;
-
-    m_lastPoll = now;
-    pollInbox();
-
-    // Periodic purge of old processed files
-    auto purgeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastPurge).count();
-    if (purgeElapsed >= PURGE_INTERVAL_MS)
+void SubmissionManager::threadFunc()
+{
+    while (m_threadRunning.load())
     {
-        m_lastPurge = now;
-        purgeProcessed();
+        for (int i = 0; i < 10 && m_threadRunning.load(); ++i)
+        {
+            if (m_wakeFlag.load()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+
+        if (!m_threadRunning.load()) break;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastPoll).count();
+        bool woken = m_wakeFlag.exchange(false);
+
+        if (elapsed < POLL_INTERVAL_MS && !woken)
+            continue;
+
+        m_lastPoll = now;
+
+        try
+        {
+            pollInbox();
+        }
+        catch (const std::exception& e)
+        {
+            MonitorLog::instance().error("farm", std::string("SubmissionManager exception: ") + e.what());
+        }
+        catch (...)
+        {
+            MonitorLog::instance().error("farm", "SubmissionManager unknown exception");
+        }
+
+        // Periodic purge of old processed files
+        auto purgeElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastPurge).count();
+        if (purgeElapsed >= PURGE_INTERVAL_MS)
+        {
+            m_lastPurge = now;
+            purgeProcessed();
+        }
     }
 }
 
@@ -91,12 +132,27 @@ void SubmissionManager::processSubmission(const fs::path& file)
     auto data = AtomicFileIO::safeReadJson(file);
     if (!data.has_value())
     {
-        MonitorLog::instance().warn("farm", "Failed to read submission file: " + file.filename().string());
-        // Move to processed to prevent retry loop
-        std::error_code ec;
-        fs::rename(file, m_farmPath / "submissions" / "processed" / file.filename(), ec);
+        std::string fname = file.filename().string();
+        int& count = m_readFailCounts[fname];
+        ++count;
+        if (count >= MAX_READ_RETRIES)
+        {
+            MonitorLog::instance().error("farm", "Giving up on unreadable submission after " +
+                                         std::to_string(count) + " retries: " + fname);
+            std::error_code ec;
+            fs::rename(file, m_farmPath / "submissions" / "processed" / file.filename(), ec);
+            m_readFailCounts.erase(fname);
+        }
+        else
+        {
+            MonitorLog::instance().info("farm", "Submission not yet readable (retry " +
+                                        std::to_string(count) + "): " + fname);
+        }
         return;
     }
+
+    // Clear retry counter on successful read
+    m_readFailCounts.erase(file.filename().string());
 
     try
     {

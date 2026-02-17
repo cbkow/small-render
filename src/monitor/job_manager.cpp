@@ -9,39 +9,83 @@
 
 namespace SR {
 
-void JobManager::scan(const std::filesystem::path& farmPath)
+JobManager::~JobManager()
 {
-    auto now = std::chrono::steady_clock::now();
-    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_lastScan).count();
-    if (elapsed < SCAN_COOLDOWN_MS && !m_invalidated)
-        return;
-    m_lastScan = now;
-    m_invalidated = false;
+    stop();
+}
 
-    try
+void JobManager::start(const std::filesystem::path& farmPath)
+{
+    if (m_running.load()) return;
+
+    m_farmPath = farmPath;
+
+    // First scan synchronous — data available immediately
+    auto result = doScan();
     {
-        scanImpl(farmPath);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_jobs = std::move(result);
     }
-    catch (const std::exception& e)
+    m_invalidated.store(false);
+
+    m_running.store(true);
+    m_thread = std::thread(&JobManager::threadFunc, this);
+}
+
+void JobManager::stop()
+{
+    m_running.store(false);
+    if (m_thread.joinable())
+        m_thread.join();
+}
+
+void JobManager::threadFunc()
+{
+    auto lastScan = std::chrono::steady_clock::now();
+
+    while (m_running.load())
     {
-        MonitorLog::instance().error("job", std::string("Scan exception: ") + e.what());
-    }
-    catch (...)
-    {
-        MonitorLog::instance().error("job", "Scan unknown exception");
+        // Sleep in small increments so we can exit quickly
+        for (int i = 0; i < 10 && m_running.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+        if (!m_running.load()) break;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastScan).count();
+
+        if (elapsed < SCAN_COOLDOWN_MS && !m_invalidated.load())
+            continue;
+
+        lastScan = now;
+        m_invalidated.store(false);
+
+        try
+        {
+            auto result = doScan();
+            std::lock_guard<std::mutex> lock(m_mutex);
+            m_jobs = std::move(result);
+        }
+        catch (const std::exception& e)
+        {
+            MonitorLog::instance().error("job", std::string("Scan exception: ") + e.what());
+        }
+        catch (...)
+        {
+            MonitorLog::instance().error("job", "Scan unknown exception");
+        }
     }
 }
 
-void JobManager::scanImpl(const std::filesystem::path& farmPath)
+std::vector<JobInfo> JobManager::doScan()
 {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    m_jobs.clear();
+    std::vector<JobInfo> jobs;
 
     namespace fs = std::filesystem;
     std::error_code ec;
-    auto jobsDir = farmPath / "jobs";
+    auto jobsDir = m_farmPath / "jobs";
     if (!fs::is_directory(jobsDir, ec))
-        return;
+        return jobs;
 
     for (const auto& entry : fs::directory_iterator(jobsDir, ec))
     {
@@ -96,7 +140,7 @@ void JobManager::scanImpl(const std::filesystem::path& farmPath)
                 }
             }
 
-            m_jobs.push_back(std::move(info));
+            jobs.push_back(std::move(info));
         }
         catch (const std::exception& e)
         {
@@ -105,12 +149,14 @@ void JobManager::scanImpl(const std::filesystem::path& farmPath)
     }
 
     // Sort: priority desc, then submitted_at asc (oldest first = FIFO within same priority)
-    std::sort(m_jobs.begin(), m_jobs.end(),
+    std::sort(jobs.begin(), jobs.end(),
         [](const JobInfo& a, const JobInfo& b) {
             if (a.current_priority != b.current_priority)
                 return a.current_priority > b.current_priority;
             return a.manifest.submitted_at_ms < b.manifest.submitted_at_ms;
         });
+
+    return jobs;
 }
 
 std::string JobManager::submitJob(const std::filesystem::path& farmPath,
@@ -219,7 +265,7 @@ std::vector<JobInfo> JobManager::getJobSnapshot() const
 
 void JobManager::invalidate()
 {
-    m_invalidated = true;
+    m_invalidated.store(true);
 }
 
 } // namespace SR

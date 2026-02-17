@@ -151,7 +151,7 @@ void FarmCleanupDialog::scanItems()
     std::error_code ec;
 
     // --- Completed/Cancelled Jobs ---
-    for (const auto& job : m_app->jobManager().jobs())
+    for (const auto& job : m_app->cachedJobs())
     {
         if (job.current_state == "completed" || job.current_state == "cancelled")
         {
