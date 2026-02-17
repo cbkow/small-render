@@ -34,6 +34,43 @@ static fs::path findBundledTemplatesDir()
     return {};
 }
 
+static fs::path findBundledPluginsDir()
+{
+    fs::path pluginsDir = fs::path(getExeDir()) / "resources" / "plugins";
+    if (fs::is_directory(pluginsDir))
+        return pluginsDir;
+    return {};
+}
+
+static void copyPlugins(const fs::path& farmPath)
+{
+    auto bundled = findBundledPluginsDir();
+    if (bundled.empty())
+    {
+        MonitorLog::instance().warn("farm", "No bundled plugins found, skipping plugin copy");
+        return;
+    }
+
+    std::error_code ec;
+    for (auto& appDir : fs::directory_iterator(bundled, ec))
+    {
+        if (!appDir.is_directory(ec)) continue;
+
+        auto destDir = farmPath / "plugins" / appDir.path().filename();
+        fs::create_directories(destDir, ec);
+
+        for (auto& entry : fs::directory_iterator(appDir.path(), ec))
+        {
+            if (!entry.is_regular_file(ec)) continue;
+            auto dest = destDir / entry.path().filename();
+            fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing, ec);
+            if (!ec)
+                MonitorLog::instance().info("farm", "Copied plugin: " +
+                    appDir.path().filename().string() + "/" + entry.path().filename().string());
+        }
+    }
+}
+
 static void copyExampleTemplates(const fs::path& farmPath)
 {
     auto bundled = findBundledTemplatesDir();
@@ -83,6 +120,7 @@ FarmInit::Result FarmInit::init(const fs::path& syncRoot, const std::string& nod
         fs::create_directories(farmPath / "jobs", ec);
         fs::create_directories(farmPath / "commands", ec);
         fs::create_directories(farmPath / "templates" / "examples", ec);
+        fs::create_directories(farmPath / "plugins", ec);
         fs::create_directories(farmPath / "submissions" / "processed", ec);
 
         // Write farm.json
@@ -98,8 +136,9 @@ FarmInit::Result FarmInit::init(const fs::path& syncRoot, const std::string& nod
         };
         AtomicFileIO::writeJson(farmPath / "farm.json", farmJson);
 
-        // Copy bundled example templates
+        // Copy bundled example templates and plugins
         copyExampleTemplates(farmPath);
+        copyPlugins(farmPath);
 
         MonitorLog::instance().info("farm", "Farm created successfully");
     }
@@ -116,8 +155,9 @@ FarmInit::Result FarmInit::init(const fs::path& syncRoot, const std::string& nod
 
             if (lastUpdate != APP_VERSION)
             {
-                MonitorLog::instance().info("farm", "Updating example templates (" + lastUpdate + " -> " + std::string(APP_VERSION) + ")");
+                MonitorLog::instance().info("farm", "Updating example templates and plugins (" + lastUpdate + " -> " + std::string(APP_VERSION) + ")");
                 copyExampleTemplates(farmPath);
+                copyPlugins(farmPath);
 
                 fj["last_example_update"] = APP_VERSION;
                 AtomicFileIO::writeJson(farmPath / "farm.json", fj);

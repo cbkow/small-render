@@ -23,7 +23,6 @@ void JobListPanel::scanJobProgress()
         return;
 
     m_lastProgressScan = now;
-    m_progressCache.clear();
 
     const auto& jobs = m_app->jobManager().jobs();
     for (const auto& job : jobs)
@@ -31,18 +30,15 @@ void JobListPanel::scanJobProgress()
         const auto& manifest = job.manifest;
         int totalFrames = manifest.frame_end - manifest.frame_start + 1;
 
-        JobProgress prog;
-        prog.total = totalFrames;
-        prog.completed = 0;
-
-        // Read dispatch.json
+        // Read dispatch.json — skip on failed read to keep last good value
         auto dispatchPath = m_app->farmPath() / "jobs" / manifest.job_id / "dispatch.json";
         auto data = AtomicFileIO::safeReadJson(dispatchPath);
         if (!data.has_value())
-        {
-            m_progressCache[manifest.job_id] = prog;
             continue;
-        }
+
+        JobProgress prog;
+        prog.total = totalFrames;
+        prog.completed = 0;
 
         try
         {

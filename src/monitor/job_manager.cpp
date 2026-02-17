@@ -131,6 +131,7 @@ std::string JobManager::submitJob(const std::filesystem::path& farmPath,
     }
     fs::create_directories(jobDir / "claims", ec);
     fs::create_directories(jobDir / "events", ec);
+    fs::create_directories(jobDir / "stdout", ec);
 
     // Check manifest doesn't already exist (race protection)
     auto manifestPath = jobDir / "manifest.json";

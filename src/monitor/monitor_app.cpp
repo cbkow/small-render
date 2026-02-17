@@ -296,7 +296,6 @@ bool MonitorApp::startFarm()
         // Start SubmissionManager (coordinator processes DCC submission inbox)
         m_submissionManager.start(
             m_farmPath, m_identity.nodeId(), getOS(),
-            // Template loader: find by template_id
             [this](const std::string& templateId) -> std::optional<JobTemplate> {
                 for (const auto& t : m_templateManager.templates())
                 {
@@ -305,7 +304,6 @@ bool MonitorApp::startFarm()
                 }
                 return std::nullopt;
             },
-            // Job submitter
             [this](const JobManifest& manifest, int priority) -> std::string {
                 return m_jobManager.submitJob(m_farmPath, manifest, priority);
             }

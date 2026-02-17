@@ -784,16 +784,14 @@ void JobDetailPanel::scanFrameStates(const std::string& jobId, const JobManifest
     m_frameStatesJobId = jobId;
 
     int totalFrames = manifest.frame_end - manifest.frame_start + 1;
-    m_frameStates.assign(totalFrames, FrameState{});
 
-    // Read dispatch.json
+    // Read dispatch.json — keep last good state on failed reads (race with sync layer)
     auto dispatchPath = m_app->farmPath() / "jobs" / jobId / "dispatch.json";
     auto data = AtomicFileIO::safeReadJson(dispatchPath);
     if (!data.has_value())
-    {
-        m_dispatchChunks.clear();
         return;
-    }
+
+    m_frameStates.assign(totalFrames, FrameState{});
 
     try
     {
@@ -854,7 +852,7 @@ void JobDetailPanel::scanFrameStates(const std::string& jobId, const JobManifest
     }
     catch (...)
     {
-        m_dispatchChunks.clear();
+        // Parse failed — keep previous good state
     }
 }
 
