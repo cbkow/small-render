@@ -83,12 +83,12 @@ struct NodeInfo
 {
     Heartbeat heartbeat;
     bool      isLocal = false;
-    bool      isDead = false;
+    bool      isDead = true;            // assume dead until seq advances
     uint32_t  staleCount = 0;           // consecutive scans with unchanged seq
     uint64_t  lastSeenSeq = 0;
     bool      clockSkewWarning = false;
     int64_t   skewAmountMs = 0;
-    bool      reclaimEligible = false;  // dead + grace scan elapsed
+    bool      reclaimEligible = true;   // dead nodes are reclaimable
 };
 
 } // namespace SR

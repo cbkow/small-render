@@ -253,9 +253,15 @@ void HeartbeatManager::scanPeers()
         try
         {
             Heartbeat hb = data.value().get<Heartbeat>();
+            bool isNew = (m_nodes.find(peerId) == m_nodes.end());
             auto& info = m_nodes[peerId];
             info.heartbeat = hb;
             info.isLocal = (peerId == m_nodeId);
+
+            // Seed lastSeenSeq on first discovery so the node must
+            // advance its seq to prove it's alive (not just stale on disk)
+            if (isNew && !info.isLocal)
+                info.lastSeenSeq = hb.seq;
         }
         catch (const std::exception& e)
         {
@@ -272,14 +278,7 @@ void HeartbeatManager::detectStaleness()
         if (info.isLocal)
             continue;
 
-        // Check if node explicitly stopped
-        if (info.heartbeat.node_state == "stopped")
-        {
-            info.isDead = true;
-            info.reclaimEligible = true;
-            continue;
-        }
-
+        // Seq-based staleness detection (runs for all nodes including stopped)
         if (info.heartbeat.seq == info.lastSeenSeq)
         {
             info.staleCount++;
@@ -292,6 +291,12 @@ void HeartbeatManager::detectStaleness()
         }
 
         info.lastSeenSeq = info.heartbeat.seq;
+
+        // Stopped nodes are alive but their chunks can be reassigned
+        if (!info.isDead && info.heartbeat.node_state == "stopped")
+        {
+            info.reclaimEligible = true;
+        }
 
         if (info.staleCount >= m_timing.dead_threshold_scans)
         {

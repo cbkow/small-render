@@ -158,11 +158,16 @@ void NodePanel::renderPeerList()
         return;
     }
 
-    // Sort: alive peers alphabetical, dead peers last
-    std::sort(peers.begin(), peers.end(), [](const NodeInfo* a, const NodeInfo* b)
+    // Sort: active first, stopped second, dead last; alphabetical within each group
+    auto sortKey = [](const NodeInfo* n) -> int {
+        if (n->isDead) return 2;
+        if (n->heartbeat.node_state == "stopped") return 1;
+        return 0;
+    };
+    std::sort(peers.begin(), peers.end(), [&sortKey](const NodeInfo* a, const NodeInfo* b)
     {
-        if (a->isDead != b->isDead)
-            return !a->isDead; // alive first
+        int ka = sortKey(a), kb = sortKey(b);
+        if (ka != kb) return ka < kb;
         return a->heartbeat.hostname < b->heartbeat.hostname;
     });
 
@@ -179,6 +184,10 @@ void NodePanel::renderPeerList()
         if (peer->isDead)
         {
             ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "[Dead]");
+        }
+        else if (hb.node_state == "stopped")
+        {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "[Stopped]");
         }
         else if (hb.render_state == "rendering")
         {
@@ -231,8 +240,6 @@ void NodePanel::renderPeerList()
         {
             if (hb.node_state == "stopped")
             {
-                ImGui::TextDisabled("(Stopped)");
-                ImGui::SameLine();
                 if (ImGui::SmallButton("Start"))
                     m_app->commandManager().sendCommand(hb.node_id, "resume_all", "", "remote_request");
             }
@@ -243,8 +250,8 @@ void NodePanel::renderPeerList()
             }
         }
 
-        // Clock skew warning
-        if (peer->clockSkewWarning)
+        // Clock skew warning (only meaningful for alive nodes)
+        if (!peer->isDead && peer->clockSkewWarning)
         {
             double skewSec = std::abs(peer->skewAmountMs) / 1000.0;
             ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.2f, 1.0f),
