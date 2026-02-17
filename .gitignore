@@ -1,0 +1,36 @@
+# Build
+build/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+
+# IDE
+.vs/
+.vscode/
+*.sln
+*.vcxproj*
+*.user
+.idea/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Binaries
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+*.exp
+
+# Dependencies (fetched by CMake)
+_deps/
+
+# Rust
+sr-agent/target/
