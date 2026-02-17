@@ -1,6 +1,7 @@
 #include "monitor/heartbeat_manager.h"
 #include "core/atomic_file_io.h"
 #include "core/platform.h"
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -35,7 +36,7 @@ void HeartbeatManager::start(const fs::path& farmPath,
     m_ramGb    = identity.systemInfo().ramMB / 1024;
     m_timing   = timing;
     m_tags     = tags;
-    m_seq      = 0;
+    m_seq.store(0);
     m_nodeState = "active";
     m_renderState = "idle";
     m_activeJob.clear();
@@ -109,6 +110,42 @@ void HeartbeatManager::setNodeState(const std::string& state)
     m_nodeState = state;
 }
 
+void HeartbeatManager::processUdpHeartbeat(const nlohmann::json& msg)
+{
+    std::string peerId = msg.value("n", "");
+    if (peerId.empty() || peerId == m_nodeId)
+        return;
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto& info = m_nodes[peerId];
+    auto myNow = nowMs();
+
+    uint64_t seq = msg.value("seq", uint64_t(0));
+    if (seq > info.lastSeenSeq)
+    {
+        info.lastSeenSeq = seq;
+        info.staleCount = 0;
+        info.isDead = false;
+    }
+
+    // Update fast-changing fields from compact UDP heartbeat
+    info.heartbeat.node_id = peerId;
+    info.heartbeat.seq = seq;
+    info.heartbeat.timestamp_ms = msg.value("ts", int64_t(0));
+    info.heartbeat.node_state = msg.value("st", std::string("active"));
+    info.heartbeat.render_state = msg.value("rs", std::string("idle"));
+    info.heartbeat.is_coordinator = msg.value("coord", false);
+    if (msg.contains("job") && !msg["job"].is_null())
+        info.heartbeat.active_job = msg["job"].get<std::string>();
+    else
+        info.heartbeat.active_job.clear();
+
+    info.isLocal = false;
+    info.hasUdpContact = true;
+    info.lastUdpContactMs = myNow;
+}
+
 // --- Background thread ---
 
 void HeartbeatManager::threadFunc()
@@ -172,14 +209,14 @@ void HeartbeatManager::writeHeartbeat()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    m_seq++;
+    m_seq.fetch_add(1);
     auto hb = buildHeartbeat();
     nlohmann::json j = hb;
 
     auto path = m_nodesDir / m_nodeId / "heartbeat.json";
     if (!AtomicFileIO::writeJson(path, j))
     {
-        MonitorLog::instance().error("health", "Failed to write heartbeat (seq=" + std::to_string(m_seq) + ")");
+        MonitorLog::instance().error("health", "Failed to write heartbeat (seq=" + std::to_string(m_seq.load()) + ")");
     }
 
     // Update local node in map
@@ -195,7 +232,7 @@ void HeartbeatManager::writeFinalHeartbeat()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    m_seq++;
+    m_seq.fetch_add(1);
     auto hb = buildHeartbeat();
     hb.node_state = "stopped";
     nlohmann::json j = hb;
@@ -213,7 +250,7 @@ Heartbeat HeartbeatManager::buildHeartbeat() const
     hb.os = m_os;
     hb.app_version = APP_VERSION;
     hb.protocol_version = PROTOCOL_VERSION;
-    hb.seq = m_seq;
+    hb.seq = m_seq.load();
     hb.timestamp_ms = nowMs();
     hb.node_state = m_nodeState;
     hb.render_state = m_renderState;
@@ -311,6 +348,10 @@ void HeartbeatManager::detectStaleness()
                 info.reclaimEligible = true;
             }
         }
+
+        // UDP contact timeout: if no UDP heartbeat for 15s, fall back to filesystem detection
+        if (info.hasUdpContact && (nowMs() - info.lastUdpContactMs > 15000))
+            info.hasUdpContact = false;
     }
 }
 

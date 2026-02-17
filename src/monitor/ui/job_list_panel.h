@@ -23,6 +23,7 @@ private:
     std::set<std::string> m_selectedJobIds;
     int m_lastClickedIndex = -1;
     bool m_pendingBulkDelete = false;
+    bool m_pendingBulkCancel = false;
 
     // Progress cache
     struct JobProgress { int completed = 0; int total = 0; };

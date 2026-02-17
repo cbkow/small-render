@@ -89,6 +89,10 @@ struct NodeInfo
     bool      clockSkewWarning = false;
     int64_t   skewAmountMs = 0;
     bool      reclaimEligible = true;   // dead nodes are reclaimable
+
+    // UDP fast path tracking (runtime only, not serialized)
+    bool    hasUdpContact = false;
+    int64_t lastUdpContactMs = 0;
 };
 
 } // namespace SR

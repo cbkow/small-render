@@ -58,40 +58,33 @@ void MonitorApp::update()
 
         if (m_farmRunning)
         {
-            // Process remote commands
+            // Phase 1: UDP fast path
+            handleUdpMessages();
+
+            // Phase 2: Filesystem slow path (dedup skips already-processed)
             auto actions = m_commandManager.popActions();
             for (const auto& action : actions)
             {
-                if (action.type == "assign_chunk")
-                {
-                    // Worker receives assignment from coordinator
-                    handleAssignChunk(action);
-                }
-                else if (action.type == "abort_chunk")
-                {
-                    // Worker receives abort from coordinator
-                    if (m_renderCoordinator.currentJobId() == action.jobId)
-                        m_renderCoordinator.abortCurrentRender("Coordinator abort: " + action.reason);
-                }
-                else if (action.type == "chunk_completed" || action.type == "chunk_failed")
-                {
-                    // Coordinator receives worker reports
-                    if (m_config.is_coordinator)
-                        m_dispatchManager.processAction(action);
-                }
-                else if (action.type == "stop_job")
-                {
-                    if (m_renderCoordinator.currentJobId() == action.jobId)
-                        m_renderCoordinator.abortCurrentRender("Remote stop: " + action.reason);
-                }
-                else if (action.type == "stop_all")
-                {
-                    setNodeState(NodeState::Stopped);
-                }
-                else if (action.type == "resume_all")
-                {
-                    setNodeState(NodeState::Active);
-                }
+                if (!action.msgId.empty() && m_dedup.isDuplicate(action.msgId))
+                    continue;
+                processAction(action);
+            }
+
+            // Periodic: UDP heartbeat (every 3s)
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - m_lastUdpHeartbeat).count() >= 3000)
+            {
+                sendUdpHeartbeat();
+                m_lastUdpHeartbeat = now;
+            }
+
+            // Periodic: dedup purge (every 30s)
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - m_lastDedupPurge).count() >= 30000)
+            {
+                m_dedup.purge();
+                m_lastDedupPurge = now;
             }
 
             m_templateManager.scan(m_farmPath);
@@ -245,6 +238,15 @@ bool MonitorApp::startFarm()
 
     m_commandManager.start(m_farmPath, m_identity.nodeId());
 
+    if (m_config.udp_enabled)
+    {
+        if (m_udpNotify.start(m_identity.nodeId(), m_config.udp_port))
+            MonitorLog::instance().info("udp", "Multicast fast path active on port " + std::to_string(m_config.udp_port));
+        else
+            MonitorLog::instance().info("udp", "Multicast unavailable, filesystem-only mode");
+    }
+    m_commandManager.setUdpNotify(m_udpNotify.isRunning() ? &m_udpNotify : nullptr);
+
     if (m_config.is_coordinator)
     {
         // Check for existing coordinator
@@ -350,7 +352,9 @@ void MonitorApp::stopFarm()
     if (!m_farmRunning)
         return;
 
+    m_commandManager.setUdpNotify(nullptr);
     m_commandManager.stop();
+    m_udpNotify.stop();
 
     if (m_config.is_coordinator)
     {
@@ -378,6 +382,97 @@ std::string MonitorApp::findCoordinatorNodeId() const
             return n.heartbeat.node_id;
     }
     return {};
+}
+
+// ─── UDP multicast fast path ─────────────────────────────────────────────────
+
+void MonitorApp::handleUdpMessages()
+{
+    if (!m_udpNotify.isRunning()) return;
+
+    for (const auto& msg : m_udpNotify.poll())
+    {
+        std::string type = msg.value("t", "");
+        if (type == "hb")
+        {
+            m_heartbeatManager.processUdpHeartbeat(msg);
+            continue;
+        }
+
+        std::string msgId = msg.value("msg_id", "");
+        if (msgId.empty() || m_dedup.isDuplicate(msgId))
+            continue;
+
+        CommandManager::Action action;
+        action.type = msg.value("type", "");
+        action.jobId = msg.value("job_id", "");
+        action.reason = msg.value("reason", "");
+        action.frameStart = msg.value("frame_start", 0);
+        action.frameEnd = msg.value("frame_end", 0);
+        action.fromNodeId = msg.value("from", "");
+        action.msgId = msgId;
+
+        if (!action.type.empty())
+            processAction(action);
+    }
+}
+
+void MonitorApp::sendUdpHeartbeat()
+{
+    if (!m_udpNotify.isRunning()) return;
+
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    m_udpNotify.send({
+        {"t", "hb"},
+        {"from", m_identity.nodeId()},
+        {"n", m_identity.nodeId()},
+        {"seq", m_heartbeatManager.localSeq()},
+        {"ts", now},
+        {"st", m_nodeState == NodeState::Active ? "active" : "stopped"},
+        {"rs", m_renderCoordinator.isRendering() ? "rendering" : "idle"},
+        {"coord", m_config.is_coordinator},
+        {"job", m_renderCoordinator.isRendering()
+            ? nlohmann::json(m_renderCoordinator.currentJobId())
+            : nlohmann::json(nullptr)},
+    });
+}
+
+void MonitorApp::processAction(const CommandManager::Action& action)
+{
+    if (action.type == "assign_chunk")
+    {
+        handleAssignChunk(action);
+    }
+    else if (action.type == "abort_chunk")
+    {
+        if (m_renderCoordinator.currentJobId() == action.jobId)
+            m_renderCoordinator.abortCurrentRender("Coordinator abort: " + action.reason);
+    }
+    else if (action.type == "chunk_completed" || action.type == "chunk_failed")
+    {
+        if (m_config.is_coordinator)
+            m_dispatchManager.processAction(action);
+    }
+    else if (action.type == "stop_job")
+    {
+        if (m_renderCoordinator.currentJobId() == action.jobId)
+            m_renderCoordinator.abortCurrentRender("Remote stop: " + action.reason);
+    }
+    else if (action.type == "stop_all")
+    {
+        setNodeState(NodeState::Stopped);
+    }
+    else if (action.type == "resume_all")
+    {
+        setNodeState(NodeState::Active);
+    }
+    else if (action.type == "submission_available")
+    {
+        if (m_config.is_coordinator)
+            m_submissionManager.wakeUp();
+    }
 }
 
 // ─── Worker: handle assign_chunk ─────────────────────────────────────────────

@@ -10,11 +10,14 @@
 #include "monitor/job_manager.h"
 #include "monitor/command_manager.h"
 #include "monitor/submission_manager.h"
+#include "core/udp_notify.h"
+#include "core/message_dedup.h"
 #include "monitor/ui/dashboard.h"
 
 #include "core/system_tray.h"
 
 #include <filesystem>
+#include <chrono>
 #include <string>
 
 namespace SR {
@@ -109,6 +112,11 @@ private:
     void loadConfig();
     void checkSubmitRequest();  // Poll for CLI submission signal file
 
+    // UDP multicast fast path
+    void handleUdpMessages();
+    void sendUdpHeartbeat();
+    void processAction(const CommandManager::Action& action);
+
     // Worker-side: handle assign_chunk from coordinator
     void handleAssignChunk(const CommandManager::Action& action);
 
@@ -128,6 +136,10 @@ private:
     RenderCoordinator m_renderCoordinator;
     CommandManager m_commandManager;
     SubmissionManager m_submissionManager;
+    UdpNotify m_udpNotify;
+    MessageDedup m_dedup;
+    std::chrono::steady_clock::time_point m_lastUdpHeartbeat{};
+    std::chrono::steady_clock::time_point m_lastDedupPurge{};
     Dashboard m_dashboard;
 
     // Farm state

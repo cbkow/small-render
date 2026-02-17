@@ -10,6 +10,8 @@
 
 namespace SR {
 
+class UdpNotify;
+
 class CommandManager
 {
 public:
@@ -40,10 +42,14 @@ public:
         int frameStart = 0;
         int frameEnd = 0;
         std::string fromNodeId;
+        std::string msgId;
     };
 
     // Pop all pending actions (main thread).
     std::vector<Action> popActions();
+
+    // Set optional UDP notifier for co-sending commands.
+    void setUdpNotify(UdpNotify* udp) { m_udpNotify = udp; }
 
 private:
     void threadFunc();
@@ -58,6 +64,8 @@ private:
     // Action queue (bg thread -> main thread)
     std::queue<Action> m_actionQueue;
     std::mutex m_mutex;
+
+    UdpNotify* m_udpNotify = nullptr;
 };
 
 } // namespace SR

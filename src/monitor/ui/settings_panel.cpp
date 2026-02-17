@@ -44,6 +44,8 @@ void SettingsPanel::loadFromConfig()
 
     m_isCoordinator = cfg.is_coordinator;
     m_autoStartAgent = cfg.auto_start_agent;
+    m_udpEnabled = cfg.udp_enabled;
+    m_udpPort = static_cast<int>(cfg.udp_port);
     m_showNotifications = cfg.show_notifications;
     m_fontScale = cfg.font_scale;
 
@@ -76,6 +78,8 @@ void SettingsPanel::applyToConfig()
 
     cfg.is_coordinator = m_isCoordinator;
     cfg.auto_start_agent = m_autoStartAgent;
+    cfg.udp_enabled = m_udpEnabled;
+    cfg.udp_port = static_cast<uint16_t>(m_udpPort);
     cfg.show_notifications = m_showNotifications;
     cfg.font_scale = m_fontScale;
 
@@ -376,6 +380,24 @@ void SettingsPanel::render()
         ImGui::Separator();
     }
 
+    // --- Network ---
+    if (ImGui::CollapsingHeader("Network", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        ImGui::Checkbox("Enable UDP multicast fast path", &m_udpEnabled);
+        ImGui::TextDisabled("Sends commands and heartbeats via LAN multicast for ~50ms delivery.");
+        ImGui::TextDisabled("Filesystem remains the durable backup. Disable for cloud-only farms.");
+
+        if (m_udpEnabled)
+        {
+            ImGui::Spacing();
+            ImGui::SetNextItemWidth(120);
+            ImGui::InputInt("Multicast port", &m_udpPort, 0);
+            if (m_udpPort < 1024) m_udpPort = 1024;
+            if (m_udpPort > 65535) m_udpPort = 65535;
+        }
+        ImGui::Separator();
+    }
+
     // --- Notifications ---
     ImGui::Checkbox("Show notifications", &m_showNotifications);
 
@@ -387,12 +409,16 @@ void SettingsPanel::render()
     {
         std::string oldSyncRoot = m_savedSyncRoot;
         bool wasCoordinator = m_app->config().is_coordinator;
+        bool wasUdpEnabled = m_app->config().udp_enabled;
+        uint16_t oldUdpPort = m_app->config().udp_port;
         applyToConfig();
         m_app->saveConfig();
 
         auto& cfg = m_app->config();
         bool needsRestart = (cfg.sync_root != oldSyncRoot) ||
-                            (cfg.is_coordinator != wasCoordinator);
+                            (cfg.is_coordinator != wasCoordinator) ||
+                            (cfg.udp_enabled != wasUdpEnabled) ||
+                            (cfg.udp_port != oldUdpPort);
 
         if (needsRestart)
         {

@@ -212,6 +212,12 @@ void NodePanel::renderPeerList()
             ImGui::TextColored(ImVec4(1.0f, 0.84f, 0.0f, 1.0f), "[Coordinator]");
         }
 
+        if (peer->hasUdpContact)
+        {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.5f, 0.8f, 1.0f, 1.0f), "[UDP]");
+        }
+
         // Hardware summary + version
         if (!hb.app_version.empty())
         {

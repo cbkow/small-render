@@ -23,6 +23,7 @@ public:
                JobSubmitter jobSubmitter);
     void stop();
     void update();  // Called from MonitorApp::update() on coordinator only
+    void wakeUp();  // Reset poll timer for immediate check (called on UDP notification)
 
 private:
     void pollInbox();

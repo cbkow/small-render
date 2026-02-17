@@ -36,6 +36,11 @@ void SubmissionManager::stop()
     m_running = false;
 }
 
+void SubmissionManager::wakeUp()
+{
+    m_lastPoll = {};  // reset to epoch → immediate poll
+}
+
 void SubmissionManager::update()
 {
     if (!m_running) return;

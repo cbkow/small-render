@@ -1,6 +1,7 @@
 #include "monitor/command_manager.h"
 #include "core/atomic_file_io.h"
 #include "core/platform.h"
+#include "core/udp_notify.h"
 
 #include <algorithm>
 #include <chrono>
@@ -75,8 +76,14 @@ void CommandManager::sendCommand(const std::string& targetNodeId,
     std::error_code ec;
     fs::create_directories(targetDir, ec);
 
-    std::string filename = std::to_string(now) + "." + m_nodeId + ".json";
+    std::string msgId = std::to_string(now) + "." + m_nodeId;
+    j["msg_id"] = msgId;
+
+    std::string filename = msgId + ".json";
     AtomicFileIO::writeJson(targetDir / filename, j);
+
+    if (m_udpNotify)
+        m_udpNotify->send(j);
 
     std::string msg = "Sent " + type + " to " + targetNodeId;
     if (!jobId.empty())
@@ -179,6 +186,9 @@ void CommandManager::pollInbox()
             action.frameStart = j.value("frame_start", 0);
             action.frameEnd = j.value("frame_end", 0);
             action.fromNodeId = j.value("from", "");
+            action.msgId = j.value("msg_id", "");
+            if (action.msgId.empty())
+                action.msgId = file.stem().string(); // fallback for old files
 
             if (!action.type.empty())
             {

@@ -81,19 +81,29 @@ void JobListPanel::render()
         if (ImGui::Button("New Job"))
             m_app->requestSubmissionMode();
 
-        // Toolbar: bulk delete button
+        // Toolbar: bulk action buttons
         const auto& jobs = m_app->jobManager().jobs();
         int deletableCount = 0;
+        int cancellableCount = 0;
         for (const auto& id : m_selectedJobIds)
         {
             for (const auto& j : jobs)
             {
-                if (j.manifest.job_id == id && isDeletableState(j.current_state))
-                {
+                if (j.manifest.job_id != id) continue;
+                if (isDeletableState(j.current_state))
                     ++deletableCount;
-                    break;
-                }
+                else if (j.current_state == "active" || j.current_state == "paused")
+                    ++cancellableCount;
+                break;
             }
+        }
+        if (cancellableCount > 0)
+        {
+            ImGui::SameLine();
+            char cancelLabel[32];
+            snprintf(cancelLabel, sizeof(cancelLabel), "Cancel (%d)", cancellableCount);
+            if (ImGui::Button(cancelLabel))
+                m_pendingBulkCancel = true;
         }
         if (deletableCount > 0)
         {
@@ -285,6 +295,42 @@ void JobListPanel::render()
                 }
                 ImGui::EndTable();
             }
+        }
+
+        // Bulk cancel confirmation popup
+        if (m_pendingBulkCancel)
+        {
+            ImGui::OpenPopup("Confirm Bulk Cancel");
+            m_pendingBulkCancel = false;
+        }
+
+        if (ImGui::BeginPopupModal("Confirm Bulk Cancel", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            ImGui::Text("Cancel %d job%s? Active renders will be aborted.",
+                         cancellableCount, cancellableCount == 1 ? "" : "s");
+
+            ImGui::Spacing();
+            if (ImGui::Button("Cancel Jobs"))
+            {
+                for (const auto& id : m_selectedJobIds)
+                {
+                    for (const auto& j : jobs)
+                    {
+                        if (j.manifest.job_id == id &&
+                            (j.current_state == "active" || j.current_state == "paused"))
+                        {
+                            m_app->cancelJob(id);
+                            break;
+                        }
+                    }
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Back"))
+                ImGui::CloseCurrentPopup();
+
+            ImGui::EndPopup();
         }
 
         // Bulk delete confirmation popup

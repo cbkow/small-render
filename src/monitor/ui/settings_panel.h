@@ -22,6 +22,8 @@ private:
     char m_tagsBuf[256] = {};
     bool m_isCoordinator = false;
     bool m_autoStartAgent = true;
+    bool m_udpEnabled = true;
+    int  m_udpPort = 4242;
     bool m_showNotifications = true;
     float m_fontScale = 1.0f;
 

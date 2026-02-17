@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <nlohmann/json_fwd.hpp>
 
 namespace SR {
 
@@ -49,6 +50,12 @@ public:
                         const std::string& activeFrames);
     void setNodeState(const std::string& state);
 
+    // UDP fast path: process compact heartbeat from UDP (main thread).
+    void processUdpHeartbeat(const nlohmann::json& msg);
+
+    // Thread-safe read of local sequence number.
+    uint64_t localSeq() const { return m_seq.load(); }
+
 private:
     void threadFunc();
     void writeHeartbeat();
@@ -80,7 +87,7 @@ private:
     std::string m_activeFrames;
 
     // State
-    uint64_t m_seq = 0;
+    std::atomic<uint64_t> m_seq{0};
     std::map<std::string, NodeInfo> m_nodes;  // node_id -> info
 
     // Thread
