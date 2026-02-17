@@ -2,7 +2,9 @@
 
 A lightweight render farm coordinator for small VFX teams and freelancers
 
-The idea for Small Render came about with the question: *Could a render farm work without any TCP communication, user networking know-how, or reliance on a central database?* 
+![Small Render Image](docs/images/smallrender_O6pDIcb1mQ.png)
+
+The idea for Small Render came about with the question: *Could a render farm work without user networking know-how, or reliance on a central database?* 
 
 ## The goals:
 - A render farm setup that any user can rapidly deploy in a few short steps.
