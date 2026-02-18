@@ -2,6 +2,9 @@
 
 A lightweight render farm coordinator for small VFX teams and freelancers
 
+> [!IMPORTANT]
+> Small Render was a short-lived experiment to see whether a render farm could sustain itself solely through communication over a file system. It works and is fine for a couple of nodes, but it is fragile. See its spiritual successor [Mid Render](https://github.com/cbkow/mid-render) for a better setup. 
+
 ![Small Render Image](docs/images/smallrender_O6pDIcb1mQ.png)
 
 The idea for Small Render came about with the question: *Could a render farm work without user networking know-how, or reliance on a central database?* 
